@@ -4,7 +4,7 @@ High-level specification
 
 | | |
 |---|---|
-| Status | Copy engine: working (command-line tool `adbcp`). Desktop app: planned, not built. |
+| Status | Copy engine: working in both directions (command-line tool `adbcp`). Desktop app: planned, not built. |
 | Platform | macOS (Apple Silicon and Intel). Linux mostly works for the engine. Windows is not supported. |
 | Last updated | 2026-11-05 |
 
@@ -14,12 +14,12 @@ Words shown in *italics* the first time are explained in the [Glossary](#glossar
 
 ## 1. Purpose
 
-Copying large amounts of data from a Mac to an Android phone over a USB cable is slow
-with the standard tools. A 60 GB game folder with 15,000 files can take many minutes,
+Copying large amounts of data between a Mac and an Android phone over a USB cable is
+slow with the standard tools. A 60 GB game folder with 15,000 files can take many minutes,
 gives little feedback, and leaves half-copied files behind if something goes wrong.
 
-adbcp copies files and folders to a connected phone as fast as the cable and phone
-allow, shows clear progress, can check that every file arrived intact, and can resume
+adbcp copies files and folders to a connected phone, or from the phone back to the Mac,
+as fast as the cable and phone allow, shows clear progress, can check that every file arrived intact, and can resume
 an interrupted copy. It has two parts:
 
 - **The copy engine** (`adbcp`): a command-line tool that does the actual work. It exists today.
@@ -30,7 +30,7 @@ an interrupted copy. It has two parts:
 
 **Goals**
 
-1. Copy large files and large folders to a phone as fast as the hardware allows.
+1. Copy large files and large folders to a phone, and from a phone, as fast as the hardware allows.
 2. Work out good settings automatically for each phone, cable and destination, with no tuning needed by the user.
 3. Show honest progress: amount copied, speed, and time left, including while big files are still in transit.
 4. Never leave broken files at the destination. A file is either fully copied or absent.
@@ -39,7 +39,6 @@ an interrupted copy. It has two parts:
 
 **Non-goals (for the first version)**
 
-- Copying from the phone to the computer.
 - Keeping two folders in sync (deleting files on the phone that were removed on the computer).
 - Copying to several phones at once.
 - Windows support.
@@ -53,6 +52,7 @@ an interrupted copy. It has two parts:
 | The cable came loose halfway | Run the same copy again with "Skip files already on the phone" on | Only missing or incomplete files are copied |
 | Make sure nothing is corrupted | Turn on "Verify after copying" | Every file is checked on both sides and any differences are listed |
 | The copy is slower than expected | Read the warning shown at the start | If the phone is on a slow (USB 2.0) cable or port, the app says so |
+| Back up photos from the phone | Switch the direction to "Phone to computer", choose `/sdcard/DCIM/Camera` and a folder on the Mac | The same fast, checked copy, in the other direction |
 
 ## 4. How it works
 
@@ -75,6 +75,7 @@ standard tool for this, which it brings along or downloads by itself.
 ```
 ┌ adbcp ──────────────────────────────────────────────────────┐
 │ Phone:   [ SM-S918B · USB 3 · 5 Gb/s              ▾ ]        │
+│ Direction: (•) Computer to phone   ( ) Phone to computer     │
 │                                                              │
 │ Copy:    ┌───────────────────────────────────────┐ [ Add… ]  │
 │          │ Uncharted…PS4/       15,177 files  58.5 GB│ [Remove]│
@@ -94,6 +95,9 @@ standard tool for this, which it brings along or downloads by itself.
 
 ### 5.2 Choosing what to copy
 
+- **Direction** chooses between copying to the phone (the default) and copying from the
+  phone. When copying from the phone, the list is filled by browsing the phone, and
+  "To" is a folder on the Mac. Everything else works the same.
 - Add files and folders with the Add button or by dragging them onto the list.
 - Folders are copied with everything inside them, keeping the folder structure.
 - The list shows the number of files and total size for each item, and the grand total.
@@ -116,6 +120,7 @@ Basic settings are always visible; the rest sit under "Advanced settings".
 
 | Setting | Default | What it does | Engine option |
 |---|---|---|---|
+| Direction | Computer to phone | Copy to the phone, or from the phone to the computer | `--pull` for phone to computer |
 | Verify after copying | On | After copying, compares a *checksum* of every file on the computer and the phone | `--verify` |
 | Skip files already on the phone | Off | Leaves out files that already exist on the phone with the same size. Used to resume | `--skip-existing` |
 | Parallel transfers | Automatic | How many files are sent at the same time. Automatic uses the measured best | `-j N` |
@@ -131,6 +136,9 @@ Basic settings are always visible; the rest sit under "Advanced settings".
 The best number of parallel transfers depends on the phone, the cable, and where the
 files go on the phone. The engine measures this itself:
 
+- **Only for copies to the phone.** Copies from the phone use fixed settings that were
+  measured once (8 parallel transfers, small files in groups on 4), because reading from
+  a phone behaves more evenly than writing to it.
 - **When:** the first time a large copy (2 GB or more, or 1,000 files or more) goes to a
   phone over a given connection and to a given kind of destination. Smaller copies use
   built-in defaults until then. "Measure now" repeats it at any time.
@@ -191,20 +199,28 @@ In plain terms, the engine combines several techniques. Each one was measured on
 6. **Quick bulk checks.** Resume and verify each check all files in one pass instead of
    one request per file.
 
+The same techniques apply when copying from the phone. There the phone compresses the
+data, the parts of a split file are read on the phone and written into place on the
+Mac, and the list of files on the phone is read in a single request.
+
 ### 6.2 Safety
 
 - **No half-written files.** Files sent in parts are assembled under a temporary name
-  and renamed only when complete. A whole file that fails part-way is removed.
+  and renamed only when complete. A whole file that fails part-way is removed. When
+  copying from the phone, every file is written under a temporary name and renamed
+  when complete.
 - **Retries.** Each file or group is retried up to three times before it counts as failed.
 - **Free space** is checked before starting.
 - **Names the phone does not allow** are reported before the copy starts instead of failing later.
-- **Cancel and interruption** stop all transfers and remove temporary files from the phone.
+- **Cancel and interruption** stop all transfers and remove temporary files from the
+  destination (the phone, or the Mac when copying from the phone).
 - **Verification** uses SHA-1 checksums computed separately on the computer and on the phone.
 
 ### 6.3 Resuming
 
 Running the same copy with "Skip files already on the phone" leaves out every file that
-already exists on the phone with the same size. A file whose copy was cut off is either
+already exists at the destination with the same size (on the phone, or on the Mac when
+copying from the phone). A file whose copy was cut off is either
 absent or has the wrong size, so it is copied again. Adding "Verify" to a resumed copy
 checks every file, including the skipped ones.
 
@@ -231,6 +247,7 @@ is the first version of the engine, which sent one file per request.
 | 1,472 small files only | 12.4 s | 5.1 s |
 | Resume check of 8,885 files | about 220 s | 1.2 s |
 | Verify 12.6 GB | about 40 s | 23–29 s |
+| Copy 12.6 GB, 1,881 files **from** the phone | 68–76 s (standard `adb pull`) | 32 s |
 
 On a USB 2.0 cable the same phone reached about 34 MB/s without compression, and up to
 about 108 MB/s of effective speed on data that compresses well.
@@ -250,16 +267,16 @@ Events arrive roughly in this order. `progress` repeats about once a second duri
 | Event | When | Fields |
 |---|---|---|
 | `warning` | Something the user should know, not fatal | `message` |
-| `start` | Files found, copy about to be planned | `version`, `serial`, `model`, `connection` (`usb` or `network`), `link_mbps` (or null), `destination`, `files`, `bytes` |
+| `start` | Files found, copy about to be planned | `version`, `serial`, `model`, `connection` (`usb` or `network`), `link_mbps` (or null), `direction` (`to_phone` or `from_phone`), `destination`, `files`, `bytes` |
 | `skip` | Files left out because they are already on the phone | `files`, `bytes` |
 | `calibration` | Measuring finished | `large_mib_per_second` and `small_files_per_second` (each by number of transfers, for example `{"2":158,"4":218,"8":294}`), `cores`, `streams`, `small_streams`, `hash_workers` |
 | `compression_test` | Compression test finished | `mib_per_second` (by method), `choice` |
 | `plan` | Settings decided | `tuning`, `compression`, `large_files`, `large_jobs`, `streams`, `split_files`, `small_files`, `small_jobs`, `small_streams`, `dry_run` |
 | `progress` | About every second while copying | `bytes_done`, `bytes_total`, `files_done`, `files_total`, `files_failed`, `bytes_per_second`, `seconds_left` (null until known), `seconds_elapsed` |
-| `file_failed` | A file could not be copied | `path` (on the phone), `error` |
+| `file_failed` | A file could not be copied | `path` (where the copy should have gone), `error` |
 | `done` | Copying finished | `files_copied`, `files_failed`, `bytes`, `seconds`, `bytes_per_second` |
 | `verify_start` | Verification starting | `files` |
-| `verify_problem` | A file failed verification | `problem` (`missing`, `unreadable` or `different`), `path` |
+| `verify_problem` | A file failed verification | `problem` (`missing`: the copy is missing or unreadable; `unreadable`: the original cannot be read; `different`), `path` |
 | `verify_done` | Verification finished | `files`, `problems`, `seconds` |
 | `error` | The copy cannot continue (also sent when cancelled, with message `interrupted`) | `message` |
 
@@ -314,8 +331,7 @@ The app also needs a few small engine commands that do not exist yet:
    on Linux; SwiftUI gives a smaller, native-looking Mac-only app.
 2. Should "Verify after copying" be on by default? It adds roughly 70–90% to the total
    time (measured: 32 s to copy 12.6 GB, then 23–29 s to verify).
-3. Is copying from the phone to the computer needed in a later version?
-4. Measurements so far come from one phone (Galaxy S23 Ultra). Other phones, USB 2.0
+3. Measurements so far come from one phone (Galaxy S23 Ultra). Other phones, USB 2.0
    cables and Wi-Fi connections still need testing.
 
 ---
