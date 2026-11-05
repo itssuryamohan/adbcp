@@ -13,10 +13,27 @@
 #     else uses zstd (lz4 if the device lacks zstd).
 #   * Detects a USB 2.0 link (a very common cable problem) and warns; there a
 #     single stream already saturates the wire, so splitting is switched off.
+#   * Small files (< 1 MiB) are batched, 200 per adb push, on their own streams
+#     running alongside the big files. Creating a file in /sdcard costs the phone
+#     ~5-10 ms however it arrives, so small files are latency-bound while big ones
+#     are bandwidth-bound; overlapping them hides most of the small-file time.
+#   * Bulk --skip-existing check and --verify (SHA-1, hardware-accelerated on the
+#     phone), one adb call each instead of one per file.
+#   * Self-tuning: stream counts come from a few seconds of measurements per phone,
+#     link speed and destination kind (/sdcard vs Android/data|obb vs /data), cached
+#     and reused (--recalibrate to redo); compression is picked by test-sending a
+#     sample of the copy's own data.
 #   * Largest jobs first, retries on transient failures, free-space check,
-#     resume via --skip-existing, md5 verification, keeps the Mac awake.
+#     keeps the Mac awake.
 #
-# Works with the stock macOS /bin/bash 3.2. Requires adb in PATH (or $ADB).
+# Measured on a Galaxy S23 Ultra over USB 3 (5 Gb/s) with real game data, against
+# the previous one-adb-call-per-file version: 13 GB / 1.9k files 42 s -> 32 s,
+# 24 GB / 8.9k files 129 s -> 64 s, 1.5k small files 12.4 s -> 5.1 s, skip check
+# of 8.9k files ~220 s -> 1.2 s, verify of 13 GB 40 s -> 29 s.
+#
+# Works with the stock macOS /bin/bash 3.2. Needs no installed adb: it uses $ADB,
+# ./platform-tools/adb next to this script (see --bundle), adb in PATH, or else
+# downloads Google's platform-tools once into a cache (signature-checked on macOS).
 
 set -uo pipefail
 
@@ -39,7 +56,8 @@ usage: adbcp [options] SRC... DEST
 
 options:
   -s SERIAL         device to use (default: \$ANDROID_SERIAL or the only device)
-  -j N              parallel streams (default: 4)
+  -j N              parallel streams for big files (default: 8); small files get
+                    2 more, or -j more when there is little big data to overlap with
   -z ALGO           compression for whole-file pushes: auto|none|lz4|zstd|brotli
                     (default: auto = none for media/archives, else zstd)
   --chunk SIZE      chunk size for split files (default: 128M)
@@ -47,18 +65,37 @@ options:
                     (default: 256M, off on a USB 2.0 link unless given; 0 = always)
   --no-split        never split files; one stream per file
   --skip-existing   skip files already on the device with the same size (resume a batch)
-  --verify          compare md5 of every copied file afterwards
+  --verify          compare SHA-1 of every file afterwards, skipped ones included
+                    (--skip-existing --verify audits an existing copy)
   --force           skip the free-space check
-  --burst           restart the adb server with ADB_BURST_MODE=1 (experimental)
+  --burst           restart the adb server with ADB_BURST_MODE=1 (experimental: faster
+                    for one stream, but 25% slower on a real multi-stream copy here)
   --libusb          restart the adb server with the libusb USB backend
   --bench [DIR]     benchmark single push vs split -j 2/4/8 with a random file in DIR
                     (default /sdcard/Download); size via --bench-size (default 1G)
+  --recalibrate     measure this phone, link and destination again (see "tuning")
   --dry-run         print the transfer plan and exit
-  -q                quiet: only errors and the final summary
+  --bundle          download Google's adb into ./platform-tools next to this script,
+                    making the folder self-contained (copy it to any Mac)
+  -q                quiet: only errors and the final summary lines
+  -v, --verbose     also list every file (or group of small files) as it finishes
+  --json            for programs: one JSON object per line on stdout (start, skip,
+                    calibration, compression_test, plan, progress, file_failed, done,
+                    verify_start, verify_problem, verify_done, warning, error)
   -h, --help        this help
 
 --burst/--libusb restart the adb server, which drops other adb sessions.
 Run 'adb kill-server' to go back to defaults.
+
+tuning: stream counts are measured per phone, link speed and destination kind
+(/sdcard, Android/data|obb, /data) in a few seconds, cached in ~/Library/Caches/
+adbcp/profiles and reused. Copies of 2 GiB or 1000 files measure first when there
+is no profile; smaller ones use defaults. Compression is chosen by test-sending a
+sample of the copy's own data when it has 2 GiB or more of compressible files.
+-j overrides the measured big-file streams.
+
+adb lookup: \$ADB, then ./platform-tools/adb next to adbcp, then adb in PATH,
+then a cached download from dl.google.com (made on first use if none found).
 
 examples:
   adbcp movie.mkv /sdcard/Movies/
@@ -68,8 +105,28 @@ EOF
   exit "${1:-0}"
 }
 
-die()  { printf 'adbcp: %s\n' "$*" >&2; exit 1; }
-warn() { printf 'adbcp: %s\n' "$*" >&2; }
+# ----------------------------------------------------------------- output ---
+# People get labelled lines and one live progress bar on stderr. With --json a program
+# (such as a GUI) gets one JSON object per line on stdout ("events", see emit calls);
+# warnings and errors still go to stderr as well.
+QUIET="" VERBOSE="" OUT_JSON=0 LIVE=0 CLR="" TAB=$(printf '\t')
+
+say()    { [ -n "$QUIET" ] || [ $OUT_JSON = 1 ] || printf '%s%-13s%s\n' "$CLR" "$1" "$2" >&2; }
+report() { [ $OUT_JSON = 1 ] || printf '%s%-13s%s\n' "$CLR" "$1" "$2" >&2; }   # shown even with -q
+warn()   { printf '%sadbcp: warning: %s\n' "$CLR" "$*" >&2; emit warning "$(js message "$*")"; }
+die()    { printf '%sadbcp: error: %s\n' "$CLR" "$*" >&2; emit error "$(js message "$*")"; exit 1; }
+
+jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$TAB/\\\\t/g" | tr -d '\000-\010\013-\037'; }
+js()   { printf '"%s":"%s"' "$1" "$(jesc "$2")"; }       # string field
+jn()   { printf '"%s":%s' "$1" "${2:-null}"; }           # number field
+# "2:158 4:218" -> {"2":158,"4":218}
+jpairs() { printf '"%s":{%s}' "$1" "$(printf '%s' "$2" | sed 's/\([^ :]*\):\([0-9]*\)/"\1":\2/g; s/ /,/g')"; }
+emit() {
+  [ $OUT_JSON = 1 ] || return 0
+  local out="{\"event\":\"$1\"" f; shift
+  for f in "$@"; do out="$out,$f"; done
+  printf '%s}\n' "$out"
+}
 
 now() {
   if [ -n "${EPOCHREALTIME:-}" ]; then printf '%s\n' "${EPOCHREALTIME/,/.}"
@@ -85,6 +142,9 @@ human() {
 
 rate() { awk -v b="$1" -v a="$2" -v c="$3" 'BEGIN { t = c - a; if (t < 0.001) t = 0.001; printf "%.1f MiB/s", b / t / 1048576 }'; }
 secs() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", b - a }'; }
+pl()   { if [ "$1" = 1 ]; then printf '%s %s' "$1" "$2"; else printf '%s %ss' "$1" "$2"; fi; }   # 1 file, 2 files
+dur()  { awk -v s="$1" 'BEGIN { s = int(s + 0.5); h = int(s / 3600); m = int(s % 3600 / 60)
+  if (h) printf "%d:%02d:%02d", h, m, s % 60; else printf "%d:%02d", m, s % 60 }'; }
 
 parse_size() {
   printf '%s\n' "$1" | awk '{
@@ -100,69 +160,192 @@ rq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 if [ "$(uname)" = Darwin ]; then
   STAT_FMT=(/usr/bin/stat -L -f '%z%t%m%t%N')
-  hmd5() { /sbin/md5 -q "$1"; }
+  HSUM=(/sbin/sha1 -r) HSUM_OFF=42      # "HASH PATH"
 else
   STAT_FMT=(stat -L --printf '%s\t%Y\t%n\n')
-  hmd5() { md5sum "$1" | cut -d' ' -f1; }
+  HSUM=(sha1sum) HSUM_OFF=43            # "HASH  PATH"
 fi
+SMALL_MAX=$BS                            # files below this are batched: per-file cost dominates
+BATCH_FILES=${ADBCP_BATCH_FILES:-200}    # files per batched adb push (200 measured best)
 
-has_feat() { printf '%s\n' "$FEATURES" | grep -qx "$1"; }
-
-# Prints the adb push compression flags for a local file.
-comp_flags() {
-  local algo=$COMP ext
-  if [ "$algo" = auto ]; then
-    ext=$(printf '%s' "${1##*.}" | tr 'A-Z' 'a-z')
-    case $INCOMPRESSIBLE in *[[:space:]]"$ext"[[:space:]]*) algo=none ;; *) algo=$AUTO_ALGO ;; esac
-  fi
-  if [ "$algo" = none ]; then echo -Z; else echo "-z $algo"; fi
-}
+has_feat() { case "
+$FEATURES
+" in *"
+$1
+"*) return 0 ;; esac; return 1; }
 
 # ---------------------------------------------------------------- workers ---
-# Run by xargs, one process per job: BYTES KIND LOCAL REMOTE SKIP COUNT
-# KIND is "push" (whole file via adb push) or "chunkI/N" (dd region into REMOTE.adbcp-part).
+# Run by xargs, one process per job: BYTES KIND ALGO LOCAL REMOTE SKIP COUNT
+#   push        whole file via adb push
+#   chunkI/N    dd region SKIP..SKIP+COUNT (MiB) into REMOTE.adbcp-part
+#   batch       LOCAL is a list of COUNT files pushed in one adb push into directory REMOTE
+# Reports through files in $ADBCP_TMP that the progress monitor reads:
+#   done     "BYTES FILES [PARTS]" per finished job (a chunk is 1/PARTS of a file)
+#   run/PID  "BYTES<TAB>REMOTE" while a large push runs, so its progress can be polled
+#   errors   "REMOTE<TAB>MESSAGE" per failed job;  failed: every remote path that failed
 job() {
-  local bytes=$1 kind=$2 src=$3 dst=$4 skip=$5 count=$6
-  local t0 t1 try err="" rcmd label done_bytes
+  local bytes=$1 kind=$2 algo=$3 src=$4 dst=$5 skip=$6 count=$7
+  local t0 t1 try err="" rcmd label zf f files=() run=""
   t0=$(now)
-  if [ "$kind" != push ]; then
-    rcmd="o=\$(dd of=$(rq "$dst.adbcp-part") bs=$BS seek=$skip conv=notrunc 2>&1) || { echo \"\$o\" >&2; exit 1; }"
-  fi
+  if [ "$algo" = none ]; then zf=-Z; else zf="-z $algo"; fi
+  case $kind in
+    chunk*) rcmd="o=\$(dd of=$(rq "$dst.adbcp-part") bs=$BS seek=$skip conv=notrunc 2>&1) || { echo \"\$o\" >&2; exit 1; }" ;;
+    batch) while IFS= read -r f; do files+=("$f"); done < "$src" ;;
+    push) if [ "$bytes" -ge $((16 * BS)) ]; then run=$ADBCP_TMP/run/$$; printf '%s\t%s\n' "$bytes" "$dst" > "$run"; fi ;;
+  esac
   for try in 1 2 3; do
-    if [ "$kind" = push ] && [ -n "$ADBCP_NATIVE" ]; then
-      "$ADB" push $(comp_flags "$src") "$src" "$dst" && break
-    elif [ "$kind" = push ]; then
-      err=$("$ADB" push -q $(comp_flags "$src") "$src" "$dst" 2>&1 >/dev/null) && break
-    else
-      err=$( { dd if="$src" bs=$BS skip="$skip" count="$count" 2>/dev/null | "$ADB" shell -T "$rcmd"; } 2>&1 >/dev/null ) && break
-    fi
+    case $kind in
+      push)  err=$("$ADB" push -q $zf "$src" "$dst" 2>&1 >/dev/null) && break ;;
+      batch) err=$("$ADB" push -q $zf "${files[@]}" "$dst" 2>&1 >/dev/null) && break ;;
+      *)     err=$( { dd if="$src" bs=$BS skip="$skip" count="$count" 2>/dev/null | "$ADB" shell -T "$rcmd"; } 2>&1 >/dev/null ) && break ;;
+    esac
     if [ $try -eq 3 ]; then
-      printf 'adbcp: FAILED %s (%s): %s\n' "$dst" "$kind" "$err" >&2
-      printf '%s\n' "$dst" >> "$ADBCP_TMP/failed"
+      [ -z "$run" ] || rm -f "$run"
+      err=$(printf '%s' "$err" | tr '\n\t' '  ' | sed "s/^adb: error: //; s/^failed to copy '.*' to '.*': //; s/  */ /g")
+      printf '%sadbcp: error: failed to copy %s: %s\n' "$ADBCP_CLR" "$dst" "${err:-unknown error}" >&2
+      printf '%s\t%s\n' "$dst" "${err:-unknown error}" >> "$ADBCP_TMP/errors"
+      if [ "$kind" = batch ]; then
+        for f in "${files[@]}"; do printf '%s/%s\n' "$dst" "${f##*/}"; done
+      else
+        printf '%s\n' "$dst"
+      fi >> "$ADBCP_TMP/failed"
       exit 1
     fi
     sleep 2
   done
-  t1=$(now)
-  printf '%s\n' "$bytes" >> "$ADBCP_TMP/done"
-  [ -n "$ADBCP_QUIET$ADBCP_NATIVE" ] && exit 0
-  done_bytes=$(awk '{ s += $1 } END { printf "%.0f", s }' "$ADBCP_TMP/done")
-  label=${dst##*/}; [ "$kind" = push ] || label="$label [${kind#chunk}]"
-  printf '[%3d%% %10s / %-10s %13s]  %s  %s in %ss\n' \
-    $((ADBCP_TOTAL > 0 ? done_bytes * 100 / ADBCP_TOTAL : 100)) "$(human "$done_bytes")" "$(human "$ADBCP_TOTAL")" \
-    "$(rate "$done_bytes" "$ADBCP_T0" "$t1")" "$label" "$(human "$bytes")" "$(secs "$t0" "$t1")" >&2
+  case $kind in
+    push)  printf '%s 1\n' "$bytes" ;;
+    batch) printf '%s %s\n' "$bytes" "$count" ;;
+    *)     printf '%s 1 %s\n' "$bytes" "${kind#*/}" ;;
+  esac >> "$ADBCP_TMP/done"
+  [ -z "$run" ] || rm -f "$run"
+  if [ -n "$ADBCP_VERBOSE" ]; then
+    t1=$(now)
+    case $kind in
+      push) label=$dst ;;
+      batch) label="$count files into $dst/" ;;
+      *) label="$dst (part ${kind#chunk})" ;;
+    esac
+    printf '%s  copied  %s  %s  %ss\n' "$ADBCP_CLR" "$label" "$(human "$bytes")" "$(secs "$t0" "$t1")" >&2
+  fi
 }
 
-verify_one() {
-  local src=$1 dst=$2 h d tmp="$ADBCP_TMP/md5.$$"
-  hmd5 "$src" > "$tmp" &
-  d=$("$ADB" shell md5sum "$(rq "$dst")" </dev/null 2>/dev/null | tr -d '\r' | awk '{ print $1 }')
-  wait; h=$(cat "$tmp"); rm -f "$tmp"
-  if [ -n "$d" ] && [ "$h" = "$d" ]; then
-    [ -n "$ADBCP_QUIET" ] || printf 'verified  %s\n' "$dst" >&2
+# Live progress until $T/stop appears. Every half second: bytes of finished jobs, plus
+# (once a second) how far the large pushes still running have got, read from the size
+# of each file on the phone, so the bar also moves inside big files. Draws a progress
+# bar for people, or emits "progress" events with --json.
+monitor() {
+  local tick=0 last=0 shown=0 inflight=0 rate=0 pp=0 pt=$ADBCP_T0 t p db df nf line next_log=10 el
+  local nerr; nerr=$(wc -l < "$T/errors" | tr -d ' ')   # reported before the copy started
+  while :; do
+    [ -f "$T/stop" ] && last=1
+    t=$(now)
+    if [ $last = 0 ] && [ $((tick % 2)) = 0 ]; then
+      inflight=0
+      cat "$T"/run/* > "$T/run.now" 2>/dev/null
+      if [ -s "$T/run.now" ]; then
+        cut -f2 "$T/run.now" | tr '\n' '\0' |
+          "$ADB" shell -T 'xargs -0 stat -c "%s %n" 2>/dev/null' > "$T/run.size" 2>/dev/null
+        inflight=$(awk -F'\t' 'FILENAME == ARGV[1] { n = $0; sub(/^[0-9]+ /, "", n); z[n] = $0 + 0; next }
+          ($2 in z) { s += (z[$2] < $1) ? z[$2] : $1 } END { printf "%.0f", s }' "$T/run.size" "$T/run.now")
+      fi
+    fi
+    set -- $(awk '{ b += $1; f += $2 / ($3 ? $3 : 1) } END { printf "%.0f %d", b, f + 0.001 }' "$T/done")
+    db=$1 df=$2
+    nf=$(sort -u "$T/failed" | wc -l | tr -d ' ')
+    if [ $last = 1 ]; then p=$db; else p=$((db + inflight)); fi
+    [ "$p" -le "$ADBCP_TOTAL" ] || p=$ADBCP_TOTAL
+    [ $last = 1 ] || [ "$p" -ge "$shown" ] || p=$shown
+    shown=$p
+    # Smoothed speed (moving average over roughly the last 2 seconds).
+    rate=$(awk -v r="$rate" -v a="$pp" -v b="$p" -v x="$pt" -v y="$t" 'BEGIN { d = y - x
+      if (d <= 0) { print r; exit } i = (b - a) / d; printf "%.0f", (r == 0) ? i : 0.8 * r + 0.2 * i }')
+    pp=$p pt=$t
+    el=$(awk -v a="$ADBCP_T0" -v b="$t" 'BEGIN { printf "%.1f", b - a }')
+    if [ $OUT_JSON = 1 ]; then
+      while [ "$(wc -l < "$T/errors" | tr -d ' ')" -gt $nerr ]; do
+        nerr=$((nerr + 1))
+        line=$(sed -n "${nerr}p" "$T/errors")
+        emit file_failed "$(js path "${line%%$TAB*}")" "$(js error "${line#*$TAB}")"
+      done
+      if [ $((tick % 2)) = 0 ] || [ $last = 1 ]; then
+        emit progress "$(jn bytes_done "$p")" "$(jn bytes_total "$ADBCP_TOTAL")" "$(jn files_done "$df")" \
+          "$(jn files_total "$NFILES")" "$(jn files_failed "$nf")" "$(jn bytes_per_second "$rate")" \
+          "$(jn seconds_left "$(awk -v r="$rate" -v p="$p" -v t="$ADBCP_TOTAL" 'BEGIN { if (r > 0) printf "%.0f", (t - p) / r }')")" \
+          "$(jn seconds_elapsed "$el")"
+      fi
+    else
+      line=$(awk -v p="$p" -v t="$ADBCP_TOTAL" -v r="$rate" -v fd="$df" -v ft="$NFILES" -v ff="$nf" -v fin="$last" -v el="$el" '
+        function h(b,  u, i) { split("B KiB MiB GiB TiB", u, " "); i = 1
+          while (b >= 1024 && i < 5) { b /= 1024; i++ } return i == 1 ? sprintf("%d B", b) : sprintf("%.1f %s", b, u[i]) }
+        function d(s,  m) { s = int(s + 0.5); if (s >= 3600) return sprintf("%d:%02d:%02d", s / 3600, s % 3600 / 60, s % 60)
+          return sprintf("%d:%02d", s / 60, s % 60) }
+        BEGIN { w = 24; pct = t > 0 ? int(p * 100 / t) : 100; n = int(pct * w / 100); bar = ""
+          for (i = 0; i < w; i++) bar = bar (i < n ? "=" : (i == n ? ">" : " "))
+          if (fin && el > 0) r = p / el           # final line: average speed, not the latest
+          tail = fin ? "in " d(el) : (r > 0 ? "about " d((t - p) / r) " left" : "estimating...")
+          printf "[%s] %3d%%  %s of %s  %s/s  %s  (%d of %d files%s)", bar, pct, h(p), h(t), h(r), tail, fd, ft,
+            ff ? ", " ff " failed" : "" }')
+      if [ $LIVE = 1 ]; then
+        printf '\r\033[K%s' "$line" >&2
+        [ $last = 0 ] || printf '\n' >&2
+      elif [ $last = 1 ] || awk -v e="$el" -v n="$next_log" 'BEGIN { exit !(e >= n) }'; then
+        printf '%s\n' "$line" >&2; next_log=$((next_log + 10))
+      fi
+    fi
+    [ $last = 1 ] && return 0
+    tick=$((tick + 1))
+    sleep 0.5
+  done
+}
+
+# SHA-1 every copied file on both sides in bulk (host and device at once) and compare.
+# On the phone SHA-1 is hardware-accelerated (1.3x faster than MD5 on an S23 Ultra);
+# P_HASH_P hashers, half the device's cores (4 of 8 measured best there).
+verify_all() {
+  local t0 hp n
+  awk -F'\t' 'FILENAME == ARGV[1] { bad[$0] = 1; next } !($4 in bad) { print $3 "\t" $4 }' \
+    "$T/failed" "$T/all" > "$T/pairs"
+  n=$(wc -l < "$T/pairs" | tr -d ' ')
+  [ "$n" -gt 0 ] || return 0
+  say "Verifying:" "$(pl "$n" file) (comparing SHA-1 checksums on this computer and the phone)..."
+  emit verify_start "$(jn files "$n")"
+  t0=$(now)
+  # Parallel hashers each write their own file: sharing one pipe would interleave lines.
+  mkdir "$T/h"
+  cut -f1 "$T/pairs" | tr '\n' '\0' |
+    xargs -0 -n 64 -P "$J" sh -c '"$@" > "$0/$$"' "$T/h" "${HSUM[@]}" 2>/dev/null &
+  hp=$!
+  cut -f2 "$T/pairs" | tr '\n' '\0' |
+    "$ADB" shell -T "d=/data/local/tmp/adbcp-verify.$$; rm -rf \$d; mkdir -p \$d &&
+      xargs -0 -n 64 -P $P_HASH_P sh -c 'sha1sum \"\$@\" > '\$d'/\$\$ 2>/dev/null' _; cat \$d/*; rm -rf \$d" > "$T/d.sum" 2>/dev/null &
+  local dp=$!
+  wait $dp; wait $hp     # wait builtin, so a cancel is handled at once
+  cat "$T"/h/* > "$T/h.sum" 2>/dev/null
+  awk -v hoff="$HSUM_OFF" '
+      FILENAME == ARGV[1] { h[substr($0, hoff)] = substr($0, 1, 40); next }
+      FILENAME == ARGV[2] { d[substr($0, 43)] = substr($0, 1, 40); next }
+      { split($0, p, "\t")
+        if (!(p[2] in d)) print "missing\t" p[2]
+        else if (!(p[1] in h)) print "unreadable\t" p[1]
+        else if (d[p[2]] != h[p[1]]) print "different\t" p[2] }' "$T/h.sum" "$T/d.sum" "$T/pairs" > "$T/problems"
+  local nbad kind path el
+  nbad=$(wc -l < "$T/problems" | tr -d ' ')
+  el=$(secs "$t0" "$(now)")
+  while IFS=$'\t' read -r kind path; do
+    case $kind in
+      missing) printf 'adbcp: error: missing or unreadable on the phone: %s\n' "$path" >&2 ;;
+      unreadable) printf 'adbcp: error: cannot read on this computer: %s\n' "$path" >&2 ;;
+      different) printf 'adbcp: error: copy differs from the original: %s\n' "$path" >&2 ;;
+    esac
+    emit verify_problem "$(js problem "$kind")" "$(js path "$path")"
+  done < "$T/problems"
+  emit verify_done "$(jn files "$n")" "$(jn problems "$nbad")" "$(jn seconds "$el")"
+  if [ "$nbad" = 0 ]; then
+    report "Verified:" "all $(pl "$n" file) match ($(dur "$el"))"
   else
-    printf 'adbcp: MISMATCH %s (host %s, device %s)\n' "$dst" "$h" "${d:-unreadable}" >&2
-    exit 1
+    report "Verified:" "$nbad of $n files have problems (listed above)"
+    return 1
   fi
 }
 
@@ -172,24 +355,272 @@ restart_server() {
   st=$("$ADB" server-status 2>/dev/null)
   [ $BURST = 1 ] && vars="$vars ADB_BURST_MODE=1"
   [ $LIBUSB = 1 ] && vars="$vars ADB_LIBUSB=1"
-  if { [ $BURST = 0 ] || printf '%s' "$st" | grep -q 'burst_mode: true'; } &&
-     { [ $LIBUSB = 0 ] || printf '%s' "$st" | grep -q 'usb_backend: LIBUSB'; }; then
+  if { [ $BURST = 0 ] || case $st in *'burst_mode: true'*) true ;; *) false ;; esac; } &&
+     { [ $LIBUSB = 0 ] || case $st in *'usb_backend: LIBUSB'*) true ;; *) false ;; esac; }; then
     return
   fi
-  warn "restarting adb server with$vars (other adb sessions will drop)"
+  say "adb server:" "restarting with$vars (other adb sessions will reconnect)"
   "$ADB" kill-server >/dev/null 2>&1
   env $vars "$ADB" start-server >/dev/null 2>&1 || die "adb start-server failed"
   local i=0
   while [ $i -lt 20 ] && [ "$("$ADB" get-state 2>/dev/null)" != device ]; do sleep 0.5; i=$((i + 1)); done
 }
 
+# ------------------------------------------------------------------ tuning ---
+# Stream counts depend on the phone, the link and the destination storage, so they are
+# measured once per (device, link, destination kind), cached, and reused; --recalibrate
+# measures again. Without a profile, copies of 2 GiB or 1000 files measure first; smaller
+# ones use these defaults, measured on a Galaxy S23 Ultra over USB 3 into /sdcard.
+#   P_J          streams for big files
+#   P_SMALL_KIB  KiB of big-file data that move in the time one small file takes
+#                (small files on 2 streams); decides how many streams small files get
+#   P_SMALL_J    streams for small files when there is little big data to overlap with
+#   P_HASH_P     parallel hashers on the device for --verify
+P_J=8 P_SMALL_KIB=3584 P_SMALL_J=8 P_HASH_P=4 P_DATE="" P_INFO="" TUNING="built-in defaults" COMP_TEST=""
+PROBE="" PROBE_RM="" PROBE_RM_PID=""
+CAL_MIN_BYTES=$((2048 * BS)) CAL_MIN_FILES=1000
+PROBE_FILE_MIB=4 PROBE_FILES_PER_STREAM=4 PROBE_FILES=40
+
+dest_kind() {
+  case $1 in
+    */Android/data|*/Android/data/*|*/Android/obb|*/Android/obb/*) echo appdir ;;   # not behind FUSE
+    /data/*) echo data ;;
+    *) echo media ;;                                                               # /sdcard: FUSE
+  esac
+}
+
+profile_path() {
+  local kind link id
+  kind=$(dest_kind "$1")
+  if [ $TRANSPORT = tcp ]; then link=tcp; else link=usb${LINK:+$((LINK / 1000000))}; fi
+  id=$(printf '%s' "$ANDROID_SERIAL" | tr -c 'A-Za-z0-9_-' '_')
+  printf '%s/profiles/%s_%s_%s\n' "$(cache_dir)" "$id" "$link" "$kind"
+}
+
+load_profile() {
+  local k v
+  [ -f "$PROFILE" ] || return 1
+  while IFS='=' read -r k v; do
+    case $k in
+      P_J|P_SMALL_KIB|P_SMALL_J|P_HASH_P)
+        case $v in ''|*[!0-9]*|0) continue ;; esac
+        eval "$k=\$v" ;;            # k is one of the four literal names above
+      P_DATE) P_DATE=$v ;;
+      P_INFO) P_INFO=$v ;;
+    esac
+  done < "$PROFILE"
+  TUNING="saved measurements from $P_DATE"
+}
+
+# Prints the smallest N (from "N:value ...") whose value reaches FRACTION of the best.
+best_n() {
+  awk -v f="$1" -v s="$2" 'BEGIN { k = split(s, a, " ")
+    for (i = 1; i <= k; i++) { split(a[i], p, ":"); if (p[2] + 0 > m) m = p[2] + 0 }
+    for (i = 1; i <= k; i++) { split(a[i], p, ":"); if (p[2] + 0 >= f * m) { print p[1]; exit } } }'
+}
+value_at() { printf '%s\n' "$2" | tr ' ' '\n' | awk -F: -v n="$1" '$1 == n { print $2 }'; }
+
+# N concurrent streams, each running REPS adb pushes of the same local paths into $PROBE
+# one after another (like real jobs: per-file setup costs included); prints seconds.
+probe_push() {
+  local n=$1 reps=$2 tag=$3 i=0 pids="" t0 t1; shift 3
+  t0=$(now)
+  while [ $i -lt $n ]; do
+    ( k=0; while [ $k -lt $reps ]; do
+        "$ADB" push -q "$@" "$PROBE/$tag$n.$i.$k" >/dev/null 2>&1 || exit 1; k=$((k + 1))
+      done ) &
+    pids="$pids $!"; i=$((i + 1))
+  done
+  local p ok=1
+  for p in $pids; do wait "$p" || ok=0; done
+  t1=$(now)
+  if [ $ok = 1 ]; then awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.3f", b - a }'; else echo 0; fi
+}
+# Best (max) of two runs: filters one-off stalls, which only ever make a run slower.
+max2() { if [ "$1" -ge "$2" ]; then echo "$1"; else echo "$2"; fi; }
+
+probe_dir_create() {
+  [ -n "$PROBE" ] && return 0
+  PROBE="$1/.adbcp-probe.$$"
+  "$ADB" shell "mkdir -p $(rq "$PROBE")" </dev/null >/dev/null 2>&1 || { PROBE=""; return 1; }
+}
+probe_dir_remove() {
+  [ -n "$PROBE" ] && "$ADB" shell "rm -rf $(rq "$PROBE")" </dev/null >/dev/null 2>&1
+  PROBE=""
+}
+# Deleting the probe's ~600 files takes seconds on /sdcard (unlink is as slow as create),
+# so it runs alongside the copy. PROBE_RM stays set until it is known to be done, so an
+# interrupted run (which kills it) removes the probe directory synchronously on exit.
+probe_dir_remove_bg() {
+  [ -n "$PROBE" ] || return 0
+  PROBE_RM=$PROBE PROBE=""
+  "$ADB" shell "rm -rf $(rq "$PROBE_RM")" </dev/null >/dev/null 2>&1 &
+  PROBE_RM_PID=$!
+}
+
+# Prints the largest N (from "N:value ...") whose value is within FRACTION of the best.
+# Used for big-file streams: on a real copy too few streams cost far more (2 instead of 8:
+# 40% slower on an S23 Ultra) than too many, so ties go to more streams.
+most_n() {
+  awk -v f="$1" -v s="$2" 'BEGIN { k = split(s, a, " ")
+    for (i = 1; i <= k; i++) { split(a[i], p, ":"); if (p[2] + 0 > m) m = p[2] + 0 }
+    for (i = 1; i <= k; i++) { split(a[i], p, ":"); if (p[2] + 0 >= f * m) n = p[1] }
+    print n }'
+}
+
+# Measures big-file streams, small-file streams and device cores at the destination.
+calibrate() {
+  local n i big="" small="" rj s2 cores dirs="" t
+  say "Measuring:" "this phone, connection and destination (one time, about 10 seconds)..."
+  probe_dir_create "$1" || { warn "cannot write to $1 to measure; using built-in defaults"; return 1; }
+  dd if=/dev/urandom of="$T/probe.bin" bs=$BS count=$PROBE_FILE_MIB 2>/dev/null
+  mkdir -p "$T/probe-small"
+  i=0; while [ $i -lt $PROBE_FILES ]; do head -c 4096 /dev/urandom > "$T/probe-small/f$i"; i=$((i + 1)); done
+  for n in 2 4 8; do i=0; while [ $i -lt $n ]; do dirs="$dirs $(rq "$PROBE/s$n.$i.0")"; i=$((i + 1)); done; done
+  "$ADB" shell "mkdir -p $dirs" </dev/null >/dev/null 2>&1
+  local trial r a b
+  for n in 2 4 8; do
+    a=0
+    for trial in 1 2; do
+      t=$(probe_push $n $PROBE_FILES_PER_STREAM b$trial. -Z "$T/probe.bin")
+      r=$(awk -v n=$n -v m=$((PROBE_FILE_MIB * PROBE_FILES_PER_STREAM)) -v t="$t" 'BEGIN { printf "%.0f", (t > 0 ? n * m / t : 0) }')
+      a=$(max2 "$a" "$r")
+    done
+    big="$big $n:$a"
+  done
+  for n in 2 4 8; do
+    t=$(probe_push $n 1 s -Z "$T"/probe-small/*)
+    small="$small $n:$(awk -v n=$n -v f=$PROBE_FILES -v t="$t" 'BEGIN { printf "%.0f", (t > 0 ? n * f / t : 0) }')"
+  done
+  big=${big# } small=${small# }
+  cores=$("$ADB" shell nproc </dev/null 2>/dev/null | tr -dc '0-9')
+  # Sanity: every probe must have moved data, else keep the defaults.
+  case " $big $small " in *:0\ *|*:\ *) warn "measuring failed ($big | $small); using built-in defaults"; return 1 ;; esac
+  P_J=$(most_n 0.95 "$big")
+  rj=$(value_at "$P_J" "$big"); s2=$(value_at 2 "$small")
+  P_SMALL_KIB=$(awk -v r="$rj" -v s="$s2" 'BEGIN { printf "%.0f", r * 1024 / s }')
+  P_SMALL_J=$(best_n 0.9 "$small")
+  P_HASH_P=$(( ${cores:-8} / 2 )); [ $P_HASH_P -ge 2 ] || P_HASH_P=2; [ $P_HASH_P -le 8 ] || P_HASH_P=8
+  P_DATE=$(date +%Y-%m-%d)
+  P_INFO="big MiB/s by streams $big; small files/s by streams $small; cores ${cores:-?}"
+  mkdir -p "${PROFILE%/*}" &&
+    printf 'P_J=%s\nP_SMALL_KIB=%s\nP_SMALL_J=%s\nP_HASH_P=%s\nP_DATE=%s\nP_INFO=%s\n' \
+      "$P_J" "$P_SMALL_KIB" "$P_SMALL_J" "$P_HASH_P" "$P_DATE" "$P_INFO" > "$PROFILE"
+  TUNING="measured now"
+  say "" "large files: $(printf '%s' "$big" | sed 's/[0-9]*://g; s/ /, /g') MiB/s on 2, 4, 8 streams -> $P_J streams"
+  say "" "small files: $(printf '%s' "$small" | sed 's/[0-9]*://g; s/ /, /g') files/s on 2, 4, 8 streams -> up to $P_SMALL_J streams"
+  say "" "phone: ${cores:-?} CPU cores -> $P_HASH_P checksum workers for --verify"
+  emit calibration "$(jpairs large_mib_per_second "$big")" "$(jpairs small_files_per_second "$small")" \
+    "$(jn cores "${cores:-null}")" "$(jn streams "$P_J")" "$(jn small_streams "$P_SMALL_J")" "$(jn hash_workers "$P_HASH_P")"
+}
+
+# Picks the compression for compressible files by test-sending a sample of this copy's
+# own data with each algorithm the device supports. Data-dependent, so not cached.
+probe_compression() {
+  local cands=none algo t r best=none bestr=0 noner size f sz results=""
+  has_feat sendrecv_v2_lz4 && cands="$cands lz4"
+  has_feat sendrecv_v2_zstd && cands="$cands zstd"
+  [ "$cands" = none ] && return 0
+  : > "$T/sample"
+  # The middle 12 MiB of up to 4 of the largest compressible files.
+  INCOMPRESSIBLE=$INCOMPRESSIBLE awk -F'\t' '
+    BEGIN { n = split(ENVIRON["INCOMPRESSIBLE"], l, /[ \n]+/); for (i = 1; i <= n; i++) if (l[i] != "") inc[l[i]] = 1 }
+    { b = $3; sub(/.*\//, "", b); e = b; sub(/.*\./, "", e); if (!(tolower(e) in inc)) print $1 "\t" $3 }' "$T/files" |
+    sort -t "$(printf '\t')" -k1,1nr | head -4 > "$T/sample.list"
+  while IFS=$'\t' read -r sz f; do
+    dd if="$f" bs=$BS skip=$((sz / 2 / BS)) count=12 2>/dev/null >> "$T/sample"
+  done < "$T/sample.list"
+  size=$(wc -c < "$T/sample" | tr -d ' ')
+  [ "$size" -ge $((4 * BS)) ] || return 0
+  probe_dir_create "$1" || return 0
+  local trial rates="" cur
+  for trial in 1 2; do          # interleaved, best of two per algorithm
+    for algo in $cands; do
+      if [ $algo = none ]; then t=$(probe_push 1 1 c -Z "$T/sample"); else t=$(probe_push 1 1 c -z $algo "$T/sample"); fi
+      r=$(awk -v b="$size" -v t="$t" 'BEGIN { printf "%.0f", (t > 0 ? b / t / 1048576 : 0) }')
+      cur=$(value_at "$algo" "$rates")
+      rates=$(printf '%s\n' $rates | grep -v "^$algo:" | tr '\n' ' ')"$algo:$(max2 "${cur:-0}" "$r")"
+    done
+  done
+  for algo in $cands; do
+    r=$(value_at "$algo" "$rates"); results="$results $algo:$r"
+    if [ "$r" -gt "$bestr" ]; then best=$algo; bestr=$r; fi
+  done
+  # Keep the default (zstd, measured best on game data) unless another beats it by 5%.
+  noner=$(value_at "$AUTO_ALGO" "$rates")
+  if [ -n "$noner" ] && [ "$best" != "$AUTO_ALGO" ] && [ $((bestr * 100)) -lt $((noner * 105)) ]; then
+    best=$AUTO_ALGO
+  fi
+  AUTO_ALGO=$best
+  COMP_TEST=$(printf '%s\n' $results | awk -F: '{ printf "%s%s %s", NR > 1 ? ", " : "", $1, $2 }')
+  emit compression_test "$(jpairs mib_per_second "${results# }")" "$(js choice "$AUTO_ALGO")"
+}
+
+ADB_TEAM=EQHXZ8M8AV   # Google LLC, signer of the official macOS platform-tools
+
+cache_dir() {
+  if [ "$(uname)" = Darwin ]; then echo "$HOME/Library/Caches/adbcp"
+  else echo "${XDG_CACHE_HOME:-$HOME/.cache}/adbcp"; fi
+}
+
+is_google_signed() {
+  local info
+  codesign --verify --strict "$1" 2>/dev/null || return 1
+  info=$(codesign -dv "$1" 2>&1)   # no pipe into grep -q: SIGPIPE + pipefail = false negative
+  case $info in *"TeamIdentifier=$ADB_TEAM"*) return 0 ;; esac
+  return 1
+}
+
+# Downloads Google's platform-tools and installs adb (plus its license notice) into $1/platform-tools.
+fetch_adb() {
+  local dir=$1 os tmp ver
+  case $(uname) in Darwin) os=darwin ;; Linux) os=linux ;; *) die "no platform-tools download for $(uname)" ;; esac
+  command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 || die "need curl and unzip to download adb"
+  say "adb:" "downloading Android platform-tools from dl.google.com..."
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/adbcp-dl.XXXXXX") || die "mktemp failed"
+  if ! curl -fL --progress-bar -o "$tmp/pt.zip" "https://dl.google.com/android/repository/platform-tools-latest-$os.zip" ||
+     ! unzip -q "$tmp/pt.zip" platform-tools/adb -d "$tmp"; then
+    rm -rf "$tmp"; die "adb download failed"
+  fi
+  unzip -q "$tmp/pt.zip" platform-tools/NOTICE.txt platform-tools/source.properties -d "$tmp" 2>/dev/null
+  if [ $os = darwin ] && ! is_google_signed "$tmp/platform-tools/adb"; then
+    rm -rf "$tmp"; die "downloaded adb is not signed by Google; refusing to use it"
+  fi
+  mkdir -p "$dir" && rm -rf "$dir/platform-tools" && mv "$tmp/platform-tools" "$dir/" || { rm -rf "$tmp"; die "cannot install adb into $dir"; }
+  rm -rf "$tmp"
+  ver=$(sed -n 's/^Pkg.Revision=//p' "$dir/platform-tools/source.properties" 2>/dev/null)
+  say "adb:" "installed version ${ver:-(unknown)} in $dir/platform-tools"
+}
+
+resolve_adb() {
+  local c
+  if [ -n "${ADB:-}" ]; then
+    command -v "$ADB" >/dev/null 2>&1 || die "ADB=$ADB not found"
+    return
+  fi
+  for c in "${SELF%/*}/platform-tools/adb" "$(command -v adb 2>/dev/null)" "$(cache_dir)/platform-tools/adb"; do
+    if [ -n "$c" ] && [ -x "$c" ]; then ADB=$c; return; fi
+  done
+  fetch_adb "$(cache_dir)"
+  ADB=$(cache_dir)/platform-tools/adb
+}
+
 connect() {
   local state
-  command -v "$ADB" >/dev/null 2>&1 || die "adb not found (install: brew install android-platform-tools)"
+  resolve_adb
   [ $BURST = 1 ] || [ $LIBUSB = 1 ] && restart_server
-  state=$("$ADB" get-state 2>&1) || die "$state"
-  [ "$state" = device ] || die "device state is '$state' (authorize the computer on the device?)"
+  local i
+  for i in 1 2 3 4 5 6; do   # a freshly started server needs a moment to see the device
+    state=$("$ADB" get-state 2>&1) && break
+    sleep 0.5
+  done
+  case $state in
+    device) ;;
+    *error*) die "${state#adb: }" ;;
+    *) die "device state is '$state' (authorize this computer on the phone?)" ;;
+  esac
   ANDROID_SERIAL=$("$ADB" get-serialno | tr -d '\r'); export ANDROID_SERIAL
+  MODEL=$("$ADB" shell getprop ro.product.model </dev/null 2>/dev/null | tr -d '\r')
   FEATURES=$("$ADB" features 2>/dev/null | tr ',' '\n' | tr -d '\r')
   case $ANDROID_SERIAL in *:*|*._tcp*|*adb-tls*) TRANSPORT=tcp ;; *) TRANSPORT=usb ;; esac
   LINK="" SLOW_LINK=0
@@ -202,8 +633,8 @@ connect() {
       END { if (!found) flush() }')
     if [ -n "$LINK" ] && [ "$LINK" -lt 5000000000 ]; then
       SLOW_LINK=1
-      [ -n "$QUIET" ] || warn "device is linked at $((LINK / 1000000)) Mb/s (USB 2.0): expect ~40 MB/s raw at best." \
-        "Use a USB 3 data cable and port for 5-10x more."
+      [ -n "$QUIET" ] || warn "the phone is connected at USB 2.0 speed ($((LINK / 1000000)) Mb/s), about 40 MB/s at best." \
+        "A USB 3 data cable and port can be 5-10x faster."
     fi
   fi
   [ $TRANSPORT = tcp ] && SLOW_LINK=1
@@ -225,7 +656,7 @@ bench() {
   dd if=/dev/urandom of="$BF" bs=$BS count=$((size / BS)) 2>/dev/null || die "cannot create test file"
   printf '\ndevice %s (%s), delayed_ack: %s, burst: %s\n\n' "$ANDROID_SERIAL" "$TRANSPORT" \
     "$(has_feat delayed_ack && echo yes || echo no)" \
-    "$("$ADB" server-status 2>/dev/null | grep -q 'burst_mode: true' && echo on || echo off)"
+    "$(case $("$ADB" server-status 2>/dev/null) in *'burst_mode: true'*) echo on ;; *) echo off ;; esac)"
   run() {
     local label=$1; shift
     t0=$(now); "$@" >/dev/null 2>&1; local rc=$?; t1=$(now)
@@ -248,8 +679,8 @@ bench() {
 
 # -------------------------------------------------------------------- main ---
 main() {
-  J=4 COMP=auto CHUNK=$((128 * BS)) SPLIT_MIN=$((256 * BS)) NO_SPLIT=0 VERIFY=0
-  SPLIT_SET=0 SKIP_EXISTING=0 DRY=0 QUIET="" FORCE=0 BURST=0 LIBUSB=0 BENCH=0 BENCH_SIZE=$((1024 * BS))
+  J=8 COMP=auto CHUNK=$((128 * BS)) SPLIT_MIN=$((256 * BS)) NO_SPLIT=0 VERIFY=0
+  J_SET=0 RECAL=0 SPLIT_SET=0 SKIP_EXISTING=0 DRY=0 FORCE=0 BURST=0 LIBUSB=0 BENCH=0 BENCH_SIZE=$((1024 * BS))
   local args=() a
   while [ $# -gt 0 ]; do
     case $1 in -s|-j|-z|--chunk|--split-min|--bench-size)
@@ -257,7 +688,7 @@ main() {
     esac
     case $1 in
       -s) ANDROID_SERIAL=$2; export ANDROID_SERIAL; shift ;;
-      -j) J=$2; shift ;;
+      -j) J=$2; J_SET=1; shift ;;
       -z) COMP=$2; shift ;;
       --chunk) CHUNK=$(parse_size "$2") || die "bad size: $2"; shift ;;
       --split-min) SPLIT_MIN=$(parse_size "$2") || die "bad size: $2"; SPLIT_SET=1; shift ;;
@@ -267,10 +698,14 @@ main() {
       --verify) VERIFY=1 ;;
       --force) FORCE=1 ;;
       --burst) BURST=1 ;;
+      --recalibrate) RECAL=1 ;;
+      --bundle) fetch_adb "${SELF%/*}"; exit 0 ;;
       --libusb) LIBUSB=1 ;;
       --bench) BENCH=1 ;;
       --dry-run) DRY=1 ;;
       -q) QUIET=1 ;;
+      -v|--verbose) VERBOSE=1 ;;
+      --json) OUT_JSON=1 ;;
       -h|--help) usage 0 ;;
       -V|--version) echo "adbcp $VERSION"; exit 0 ;;
       --) shift; break ;;
@@ -280,6 +715,8 @@ main() {
     shift
   done
   set -- ${args[@]+"${args[@]}"} "$@"
+  # A live, redrawn progress line only for a person watching a terminal.
+  if [ $OUT_JSON = 0 ] && [ -z "$QUIET" ] && [ -t 2 ]; then LIVE=1 CLR=$'\r\033[K'; fi
 
   case $J in ''|*[!0-9]*|0) die "-j needs a positive integer" ;; esac
   case $COMP in auto|none|any|lz4|zstd|brotli) ;; *) die "unknown compression: $COMP" ;; esac
@@ -298,13 +735,22 @@ main() {
   connect
   [ $dest_is_dir = 1 ] ||
     [ "$("$ADB" shell "[ -d $(rq "$dest") ] && echo y" </dev/null 2>/dev/null | tr -d '\r')" = y ] && dest_is_dir=1
+  local dest_dir=$dest linkdesc; [ $dest_is_dir = 1 ] || dest_dir=${dest%/*}
+  if [ $TRANSPORT = tcp ]; then linkdesc="network (Wi-Fi)"
+  elif [ -z "$LINK" ]; then linkdesc="USB"
+  elif [ "$LINK" -ge 1000000000 ]; then linkdesc="USB, $((LINK / 1000000000)) Gb/s"
+  else linkdesc="USB, $((LINK / 1000000)) Mb/s"; fi
+  say "Device:" "${MODEL:-unknown model} ($ANDROID_SERIAL), $linkdesc"
+  PROFILE=$(profile_path "$dest_dir")
+  load_profile || true
 
   ADBCP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/adbcp.XXXXXX") || die "mktemp failed"
   T=$ADBCP_TMP finished=0
-  : > "$T/files"; : > "$T/jobs"; : > "$T/split"; : > "$T/done"; : > "$T/failed"
-  trap 'rc=$?; [ $finished = 1 ] || [ ! -s "$T/split" ] || cleanup_parts; rm -rf "$T"; exit $rc' EXIT
+  : > "$T/files"; : > "$T/split"; : > "$T/done"; : > "$T/failed"; : > "$T/errors"; mkdir "$T/run"
+  trap 'rc=$?; probe_dir_remove; [ -z "$PROBE_RM" ] || { PROBE=$PROBE_RM; probe_dir_remove; }; [ $finished = 1 ] || [ ! -s "$T/split" ] || cleanup_parts; rm -rf "$T"; exit $rc' EXIT
   # Take down xargs, workers and adb clients too (works when we lead our process group, as from a terminal).
-  trap 'trap "" INT TERM; kill -TERM -- -$$ 2>/dev/null; exit 130' INT TERM
+  trap 'trap "" INT TERM; printf "%sadbcp: interrupted\n" "$CLR" >&2; emit error "$(js message interrupted)"
+    kill -TERM -- -$$ 2>/dev/null; exit 130' INT TERM
 
   # File list: SIZE \t MTIME \t LOCAL \t REMOTE
   local src root base
@@ -326,58 +772,197 @@ main() {
     fi
   done
   [ -s "$T/files" ] || die "nothing to copy"
+  local all_n all_b odd
+  all_n=$(wc -l < "$T/files" | tr -d ' '); all_b=$(awk '{ s += $1 } END { printf "%.0f", s }' "$T/files")
+  odd=$(for src in "$@"; do [ -d "$src" ] && find -L "$src" -type f \( -name $'*\t*' -o -name $'*\n*' \) -print0; done | tr -cd '\0' | wc -c | tr -d ' ')
+  [ "$odd" = 0 ] || warn "skipping $(pl "$odd" file) whose names contain tabs or line breaks"
+  # Android's shared storage (/sdcard) refuses these characters in file and folder names,
+  # like Windows. Such files would only fail after retries, so report them up front.
+  NBADNAME=0
+  if [ "$(dest_kind "$dest_dir")" = media ]; then
+    T=$T DEST=$dest awk -F'\t' 'BEGIN { n = length(ENVIRON["DEST"]); T = ENVIRON["T"] }
+      substr($4, n + 1) ~ /["*:<>?|\\]/ {
+        print $4 >> (T "/failed")
+        print $4 "\t" "the name contains a character the phone does not allow (one of \" * : < > ? | \\)" >> (T "/errors")
+        next }
+      { print }' "$T/files" > "$T/files.ok"
+    mv "$T/files.ok" "$T/files"
+    NBADNAME=$(wc -l < "$T/failed" | tr -d ' ')
+    if [ "$NBADNAME" != 0 ]; then
+      warn "$(pl "$NBADNAME" file) with names the phone does not allow (with one of \" * : < > ? | \\) and will be skipped:"
+      head -5 "$T/failed" | sed 's/^/    /' >&2
+      [ "$NBADNAME" -le 5 ] || printf '    ... and %d more\n' $((NBADNAME - 5)) >&2
+    fi
+    [ -s "$T/files" ] || die "no files left to copy"
+  fi
+  cp "$T/files" "$T/all"   # --verify checks every file, including ones --skip-existing skips
+  say "Source:" "$(pl "$all_n" file), $(human "$all_b")"
+  say "Destination:" "$dest$([ $dest_is_dir = 1 ] && echo /)"
+  emit start "$(js version "$VERSION")" "$(js serial "$ANDROID_SERIAL")" "$(js model "$MODEL")" \
+    "$(js connection "$([ $TRANSPORT = tcp ] && echo network || echo usb)")" \
+    "$(jn link_mbps "$([ -n "$LINK" ] && echo $((LINK / 1000000)))")" \
+    "$(js destination "$dest")" "$(jn files "$all_n")" "$(jn bytes "$all_b")"
+  if [ $OUT_JSON = 1 ] && [ -s "$T/errors" ]; then     # names the phone does not allow
+    local a b
+    while IFS=$'\t' read -r a b; do emit file_failed "$(js path "$a")" "$(js error "$b")"; done < "$T/errors"
+  fi
 
   if [ $SKIP_EXISTING = 1 ]; then
     if has_feat shell_v2; then
       local before after
-      before=$(wc -l < "$T/files")
-      cut -f4 "$T/files" | "$ADB" shell -T \
-        'while IFS= read -r f; do s=$(stat -c %s "$f" 2>/dev/null) && echo "$s $f"; done' > "$T/remote" 2>/dev/null
+      before=$(wc -l < "$T/files" | tr -d ' ')
+      cut -f4 "$T/files" | tr '\n' '\0' |
+        "$ADB" shell -T 'xargs -0 -n 500 stat -c "%s %n" 2>/dev/null' > "$T/remote" 2>/dev/null
       awk -F'\t' 'FILENAME == ARGV[1] { p = $0; sub(/^[0-9]+ /, "", p); have[p] = $0 + 0; next }
         !(($4 in have) && have[$4] == $1)' "$T/remote" "$T/files" > "$T/files.new"
       mv "$T/files.new" "$T/files"
-      after=$(wc -l < "$T/files")
-      [ -n "$QUIET" ] || [ $before -eq $after ] || warn "skipping $((before - after)) file(s) already on the device"
-      [ -s "$T/files" ] || { [ -n "$QUIET" ] || warn "nothing to do"; finished=1; exit 0; }
+      after=$(wc -l < "$T/files" | tr -d ' ')
+      if [ $before -ne $after ]; then
+        say "Skipping:" "$(pl $((before - after)) file) already on the phone with the same size"
+        emit skip "$(jn files $((before - after)))" \
+          "$(jn bytes $(( $(awk '{ s += $1 } END { printf "%.0f", s }' "$T/all") - $(awk '{ s += $1 } END { printf "%.0f", s }' "$T/files") )))"
+      fi
+      if [ ! -s "$T/files" ]; then
+        report "Copied:" "nothing to copy; all $(pl "$before" file) are already on the phone"
+        emit done "$(jn files_copied 0)" "$(jn files_failed 0)" "$(jn bytes 0)" "$(jn seconds 0)"
+        finished=1
+        if [ $VERIFY = 1 ]; then verify_all; exit; fi
+        exit 0
+      fi
     else
       warn "--skip-existing needs shell_v2 on the device; ignored"
     fi
   fi
 
-  # Jobs: BYTES \t KIND \t LOCAL \t REMOTE \t SKIP \t COUNT
-  local split_ok=0 size mtime dst blocks nch k skip bytes cb=$((CHUNK / BS)) total=0 nfiles=0
+  # Tune: measure the phone/link/destination if asked or if this copy is big and there
+  # is no profile yet; pick compression by test-sending this copy's own data.
+  if [ $DRY = 0 ]; then
+    local tot0 nf0 cbytes
+    tot0=$(awk '{ s += $1 } END { printf "%.0f", s }' "$T/files"); nf0=$(wc -l < "$T/files" | tr -d ' ')
+    if [ $RECAL = 1 ] ||
+       { [ "$TUNING" = "built-in defaults" ] && { [ "$tot0" -ge $CAL_MIN_BYTES ] || [ "$nf0" -ge $CAL_MIN_FILES ]; }; }; then
+      "$ADB" shell "mkdir -p $(rq "$dest_dir")" </dev/null >/dev/null 2>&1
+      calibrate "$dest_dir" || true
+    fi
+    if [ "$COMP" = auto ] && [ $AUTO_ALGO != none ]; then
+      cbytes=$(INCOMPRESSIBLE=$INCOMPRESSIBLE awk -F'\t' '
+        BEGIN { n = split(ENVIRON["INCOMPRESSIBLE"], l, /[ \n]+/); for (i = 1; i <= n; i++) if (l[i] != "") inc[l[i]] = 1 }
+        { b = $3; sub(/.*\//, "", b); e = b; sub(/.*\./, "", e); if (!(tolower(e) in inc)) s += $1 }
+        END { printf "%.0f", s }' "$T/files")
+      if [ "$cbytes" -ge $CAL_MIN_BYTES ]; then
+        "$ADB" shell "mkdir -p $(rq "$dest_dir")" </dev/null >/dev/null 2>&1
+        probe_compression "$dest_dir"
+      fi
+    fi
+    probe_dir_remove_bg
+  fi
+  [ $J_SET = 1 ] || J=$P_J
+
+  # Plan in one awk pass. Jobs (see job()): BYTES KIND ALGO LOCAL REMOTE SKIP COUNT
+  #   $T/big    whole-file pushes and chunks, run on -j streams, largest first
+  #   $T/small  batches of small files, run at the same time on their own streams:
+  #             they are bound by per-file latency on the device (~10 ms to create
+  #             a file in /sdcard), so they overlap well with bandwidth-bound big files
+  #   $T/split  files assembled from chunks;  $T/dirs  directories batches push into
+  local split_ok=0 total nfiles nbig nsmall nbatch workers sworkers
   [ $NO_SPLIT = 0 ] && [ $J -gt 1 ] && has_feat shell_v2 && split_ok=1
   # A saturated link gains nothing from more streams; compression helps instead.
   [ $SLOW_LINK = 1 ] && [ $SPLIT_SET = 0 ] && split_ok=0
-  while IFS=$'\t' read -r size mtime src dst; do
-    total=$((total + size)); nfiles=$((nfiles + 1))
-    # Split streams can't compress, so only incompressible files are split.
-    if [ $split_ok = 1 ] && [ "$size" -ge "$SPLIT_MIN" ] && [ "$size" -gt "$CHUNK" ] &&
-       [ "$(comp_flags "$src")" = -Z ]; then
-      blocks=$(( (size + BS - 1) / BS )); nch=$(( (blocks + cb - 1) / cb )); k=0
-      while [ $k -lt $nch ]; do
-        skip=$((k * cb)); bytes=$CHUNK
-        [ $k -eq $((nch - 1)) ] && bytes=$((size - skip * BS))
-        printf '%s\tchunk%s/%s\t%s\t%s\t%s\t%s\n' "$bytes" $((k + 1)) "$nch" "$src" "$dst" "$skip" "$cb" >> "$T/jobs"
-        k=$((k + 1))
-      done
-      printf '%s\t%s\t%s\t%s\n' "$size" "$mtime" "$src" "$dst" >> "$T/split"
-    else
-      printf '%s\tpush\t%s\t%s\t0\t0\n' "$size" "$src" "$dst" >> "$T/jobs"
-    fi
-  done < "$T/files"
-  sort -t "$(printf '\t')" -k1,1nr -o "$T/jobs" "$T/jobs"
-  local njobs workers
-  njobs=$(wc -l < "$T/jobs" | tr -d ' ')
-  workers=$J; [ "$njobs" -lt "$workers" ] && workers=$njobs
+  : > "$T/big"; : > "$T/small"; : > "$T/dirs"
+  T=$T COMP=$COMP AUTO_ALGO=$AUTO_ALGO INCOMPRESSIBLE=$INCOMPRESSIBLE SPLIT_OK=$split_ok \
+  SPLIT_MIN=$SPLIT_MIN CHUNK=$CHUNK BS=$BS SMALL_MAX=$SMALL_MAX BATCH_FILES=$BATCH_FILES \
+  awk -F'\t' '
+    BEGIN {
+      OFS = "\t"; T = ENVIRON["T"]; comp = ENVIRON["COMP"]; auto = ENVIRON["AUTO_ALGO"]
+      n = split(ENVIRON["INCOMPRESSIBLE"], l, /[ \n]+/); for (i = 1; i <= n; i++) if (l[i] != "") inc[l[i]] = 1
+      split_ok = ENVIRON["SPLIT_OK"] + 0; smin = ENVIRON["SPLIT_MIN"] + 0; chunk = ENVIRON["CHUNK"] + 0
+      bs = ENVIRON["BS"] + 0; small = ENVIRON["SMALL_MAX"] + 0; maxb = ENVIRON["BATCH_FILES"] + 0
+    }
+    {
+      size = $1 + 0; src = $3; dst = $4
+      sb = src; sub(/.*\//, "", sb); db = dst; sub(/.*\//, "", db)
+      algo = comp
+      if (comp == "auto") { ext = sb; sub(/.*\./, "", ext); algo = (tolower(ext) in inc) ? "none" : auto }
+      # Split streams cannot compress, so only incompressible files are split.
+      if (split_ok && size >= smin && size > chunk && algo == "none") {
+        cb = chunk / bs; nch = int((int((size + bs - 1) / bs) + cb - 1) / cb)
+        for (k = 0; k < nch; k++) {
+          skip = k * cb
+          printf "%.0f\tchunk%d/%d\tnone\t%s\t%s\t%d\t%d\n", (k == nch - 1) ? size - skip * bs : chunk,
+            k + 1, nch, src, dst, skip, cb > (T "/big")
+        }
+        print $1, $2, src, dst > (T "/split")
+        next
+      }
+      if (size < small && sb == db) {
+        d = dst; sub(/\/[^\/]*$/, "", d); key = d SUBSEP algo
+        if (!(key in cnt)) { order[++nk] = key; kdir[key] = d; kalgo[key] = algo }
+        c = ++cnt[key]; gsize[key, c] = size; gsrc[key, c] = src; gdst[key, c] = dst
+        next
+      }
+      printf "%.0f\tpush\t%s\t%s\t%s\t0\t0\n", size, algo, src, dst > (T "/big")
+    }
+    END {
+      for (o = 1; o <= nk; o++) {
+        key = order[o]; c = cnt[key]
+        if (c == 1) {
+          printf "%.0f\tpush\t%s\t%s\t%s\t0\t0\n", gsize[key, 1], kalgo[key], gsrc[key, 1], gdst[key, 1] > (T "/small")
+          continue
+        }
+        print kdir[key] > (T "/dirs")
+        for (i = 1; i <= c; i += maxb) {
+          f = T "/batch." (++nb); bytes = 0
+          for (j = i; j < i + maxb && j <= c; j++) { print gsrc[key, j] > f; bytes += gsize[key, j] }
+          close(f)
+          printf "%.0f\tbatch\t%s\t%s\t%s\t0\t%d\n", bytes, kalgo[key], f, kdir[key], j - i > (T "/small")
+        }
+      }
+    }' "$T/files"
+  sort -t "$(printf '\t')" -k1,1nr -o "$T/big" "$T/big"
+  total=$(awk '{ s += $1 } END { printf "%.0f", s }' "$T/files")
+  nfiles=$(wc -l < "$T/files" | tr -d ' ')
+  if [ $J = 1 ]; then cat "$T/small" >> "$T/big"; : > "$T/small"; fi   # -j 1: strictly one stream
+  local dirs_sync=0; [ $J = 1 ] && [ -s "$T/dirs" ] && dirs_sync=1          # no small pool to create them
+  nbig=$(wc -l < "$T/big" | tr -d ' '); nsmall=$(wc -l < "$T/small" | tr -d ' ')
+  nbatch=$(grep -c "$(printf '\tbatch\t')" "$T/small")
+  workers=$J; [ "$nbig" -lt "$workers" ] && workers=$nbig
+  # Small files get 2 streams unless they would take over twice as long as the big data,
+  # then P_SMALL_J streams. More small streams slow the big ones down (S23 Ultra, 24 GB
+  # with 7.4k small files: 2 streams 7% faster than 8), but with no big data to overlap,
+  # 8 small streams ran 2.5x faster than 2. P_SMALL_KIB converts files to bytes.
+  local nsmallfiles bigbytes
+  nsmallfiles=$(awk -F'\t' '{ n += ($2 == "batch") ? $7 : 1 } END { print n + 0 }' "$T/small")
+  bigbytes=$(awk '{ s += $1 } END { printf "%.0f", s }' "$T/big")
+  if [ -n "${ADBCP_SMALL_STREAMS:-}" ]; then sworkers=$ADBCP_SMALL_STREAMS
+  elif [ $((nsmallfiles * P_SMALL_KIB)) -le $((bigbytes / 1024 * 2)) ]; then sworkers=2
+  else sworkers=$P_SMALL_J; fi
+  [ "$nsmall" -lt "$sworkers" ] && sworkers=$nsmall
 
-  if [ -z "$QUIET" ] || [ $DRY = 1 ]; then
-    printf 'adbcp: %s (%s, delayed_ack %s) | %d file(s), %s | %d job(s) on %d stream(s) | compression %s\n' \
-      "$ANDROID_SERIAL" "$TRANSPORT" "$(has_feat delayed_ack && echo yes || echo no)" "$nfiles" "$(human $total)" \
-      "$njobs" "$workers" "$([ "$COMP" = auto ] && echo "auto/$AUTO_ALGO" || echo "$COMP")" >&2
-  fi
+  local nsplit nchunks nbigfiles comptext plantext algo_used
+  nsplit=$(wc -l < "$T/split" | tr -d ' '); nchunks=$(grep -c "$(printf '\tchunk')" "$T/big")
+  nbigfiles=$((nfiles - nsmallfiles))
+  if [ "$COMP" != auto ]; then algo_used=$COMP; comptext="$COMP (set with -z)"
+  elif [ "$AUTO_ALGO" = none ]; then algo_used=none; comptext="off"
+  elif [ -n "$COMP_TEST" ]; then algo_used=$AUTO_ALGO
+    comptext="$AUTO_ALGO for compressible files (tested on this data: $COMP_TEST MiB/s)"
+  else algo_used=$AUTO_ALGO; comptext="$AUTO_ALGO for compressible files; media and archives are sent as they are"; fi
+  plantext=""
+  if [ $J = 1 ]; then plantext="$(pl "$nfiles" file), one at a time"; nbig=0; nsmall=0; fi
+  [ "$nbig" = 0 ] || plantext="$(pl "$nbigfiles" "large file") on $(pl "$workers" stream)"
+  [ "$nsplit" = 0 ] || plantext="$plantext ($nsplit split into $(pl "$nchunks" part))"
+  [ "$nbig" = 0 ] || [ "$nsmall" = 0 ] || plantext="$plantext; "
+  [ "$nsmall" = 0 ] || plantext="$plantext$(pl "$nsmallfiles" "small file") in $(pl "$nsmall" group) on $(pl "$sworkers" stream)"
+  if [ $J = 1 ]; then nbig=$(wc -l < "$T/big" | tr -d ' '); nsmall=0; fi
+  say "Tuning:" "$TUNING"
+  say "Compression:" "$comptext"
+  say "Plan:" "$plantext"
+  emit plan "$(js tuning "$TUNING")" "$(js compression "$algo_used")" \
+    "$(jn large_files "$nbigfiles")" "$(jn large_jobs "$nbig")" "$(jn streams "$workers")" "$(jn split_files "$nsplit")" \
+    "$(jn small_files "$nsmallfiles")" "$(jn small_jobs "$nsmall")" "$(jn small_streams "$sworkers")" "$(jn dry_run "$DRY")"
   if [ $DRY = 1 ]; then
-    awk -F'\t' '{ printf "  %-10s %12d B  %s -> %s\n", $2, $1, $3, $4 }' "$T/jobs"
+    [ $OUT_JSON = 1 ] || cat "$T/big" "$T/small" | awk -F'\t' '{
+      if ($2 == "batch") printf "  %-10s %12d B  %d files -> %s/\n", $2, $1, $7, $5
+      else printf "  %-10s %12d B  %s -> %s\n", $2, $1, $4, $5 }'
     finished=1; exit 0
   fi
 
@@ -391,23 +976,49 @@ main() {
   fi
 
   if [ -s "$T/split" ]; then
-    local prep=""
+    local prep="" size mtime src dst
     while IFS=$'\t' read -r size mtime src dst; do
       prep="$prep mkdir -p $(rq "${dst%/*}") && rm -f $(rq "$dst.adbcp-part") || exit 1;"
     done < "$T/split"
     "$ADB" shell "$prep" </dev/null || die "cannot prepare destination on device"
   fi
 
-  ADBCP_NATIVE=""
-  [ "$njobs" = 1 ] && [ -z "$QUIET" ] && [ -t 1 ] && [ ! -s "$T/split" ] && ADBCP_NATIVE=1
-  ADBCP_T0=$(now) ADBCP_TOTAL=$total ADBCP_QUIET=$QUIET
-  export ADB ADBCP_TMP ADBCP_T0 ADBCP_TOTAL ADBCP_QUIET ADBCP_NATIVE COMP AUTO_ALGO
+  ADBCP_T0=$(now) ADBCP_TOTAL=$total NFILES=$((nfiles + NBADNAME)) ADBCP_VERBOSE=$VERBOSE ADBCP_CLR=$CLR
+  export ADB ADBCP_TMP ADBCP_VERBOSE ADBCP_CLR
   command -v caffeinate >/dev/null 2>&1 && { caffeinate -i -w $$ >/dev/null 2>&1 & }
+  local monpid=""
+  if [ $OUT_JSON = 1 ] || [ -z "$QUIET" ]; then monitor & monpid=$!; fi
 
-  tr '\t\n' '\0\0' < "$T/jobs" | xargs -0 -n 6 -P "$workers" "$BASH" "$SELF" __job
+  local spid=""
+  # Batches push into existing directories. Normally the small-file pool creates them
+  # (overlapping with big files); with -j 1 there is no such pool, so create them first.
+  if [ $dirs_sync = 1 ]; then
+    tr '\n' '\0' < "$T/dirs" | "$ADB" shell -T 'xargs -0 mkdir -p' >/dev/null 2>&1 ||
+      warn "could not create some destination directories"
+  fi
+  if [ "$nsmall" -gt 0 ]; then
+    {
+      if [ -s "$T/dirs" ]; then
+        tr '\n' '\0' < "$T/dirs" | "$ADB" shell -T 'xargs -0 mkdir -p' >/dev/null 2>&1 ||
+          warn "could not create some destination directories"
+      fi
+      tr '\t\n' '\0\0' < "$T/small" | xargs -0 -n 7 -P "$sworkers" "$BASH" "$SELF" __job
+    } &
+    spid=$!
+  fi
+  # Both pools run in the background and the script waits with the wait builtin: bash
+  # handles a signal (cancel) only between foreground commands, but interrupts wait.
+  local bpid=""
+  if [ "$nbig" -gt 0 ]; then
+    tr '\t\n' '\0\0' < "$T/big" | xargs -0 -n 7 -P "$workers" "$BASH" "$SELF" __job &
+    bpid=$!
+  fi
+  [ -z "$bpid" ] || wait "$bpid"
+  [ -z "$spid" ] || wait "$spid"
+  [ -z "$PROBE_RM_PID" ] || { wait "$PROBE_RM_PID" 2>/dev/null; PROBE_RM=""; }
 
   # Move completed split files into place.
-  local res
+  local res size mtime src dst
   while IFS=$'\t' read -r size mtime src dst; do
     local p d; p=$(rq "$dst.adbcp-part"); d=$(rq "$dst")
     if grep -Fxq -- "$dst" "$T/failed"; then
@@ -415,26 +1026,35 @@ main() {
     fi
     res=$("$ADB" shell "s=\$(stat -c %s $p) && [ \"\$s\" = $size ] && mv -f $p $d && { touch -m -d @$mtime $d 2>/dev/null; echo ok; } || echo \"size \$s, expected $size\"" </dev/null 2>&1 | tr -d '\r' | tail -n 1)
     if [ "$res" != ok ]; then
-      warn "FAILED to finalize $dst: $res"
+      printf '%sadbcp: error: failed to finish %s: %s\n' "$CLR" "$dst" "$res" >&2
+      printf '%s\t%s\n' "$dst" "could not assemble the file: $res" >> "$T/errors"
       printf '%s\n' "$dst" >> "$T/failed"
       "$ADB" shell "rm -f $p" </dev/null >/dev/null 2>&1
     fi
   done < "$T/split"
   finished=1
+  [ -z "$monpid" ] || { touch "$T/stop"; wait "$monpid"; }
 
-  local t1 nfail done_bytes vfail=0
-  t1=$(now)
+  local t1 nfail done_bytes vfail=0 el
+  t1=$(now); el=$(secs "$ADBCP_T0" "$t1")
   done_bytes=$(awk '{ s += $1 } END { printf "%.0f", s }' "$T/done")
   nfail=$(sort -u "$T/failed" | wc -l | tr -d ' ')
-  printf 'adbcp: %d/%d file(s), %s in %ss, %s\n' $((nfiles - nfail)) "$nfiles" "$(human "$done_bytes")" \
-    "$(secs "$ADBCP_T0" "$t1")" "$(rate "$done_bytes" "$ADBCP_T0" "$t1")" >&2
-
-  if [ $VERIFY = 1 ]; then
-    cut -f3,4 "$T/files" | while IFS=$'\t' read -r src dst; do
-      grep -Fxq -- "$dst" "$T/failed" || printf '%s\0%s\0' "$src" "$dst"
-    done | xargs -0 -n 2 -P "$J" "$BASH" "$SELF" __verify || vfail=1
-    [ $vfail = 0 ] && warn "all copied files verified"
+  nfiles=$((nfiles + NBADNAME))
+  if [ "$nfail" = 0 ]; then
+    report "Copied:" "$(pl "$nfiles" file), $(human "$done_bytes") in $(dur "$el"), $(rate "$done_bytes" "$ADBCP_T0" "$t1")"
+  else
+    report "Copied:" "$((nfiles - nfail)) of $nfiles files, $(human "$done_bytes") in $(dur "$el")"
+    if [ "$NBADNAME" = "$nfail" ]; then
+      report "Failed:" "$(pl "$nfail" file) with names the phone does not allow; rename and copy again."
+    else
+      report "Failed:" "$(pl "$nfail" file) (listed above). Run the same command with --skip-existing to retry them."
+      [ "$NBADNAME" = 0 ] || report "" "$NBADNAME of them have names the phone does not allow; rename those first."
+    fi
   fi
+  emit done "$(jn files_copied $((nfiles - nfail)))" "$(jn files_failed "$nfail")" "$(jn bytes "$done_bytes")" \
+    "$(jn seconds "$el")" "$(jn bytes_per_second "$(awk -v b="$done_bytes" -v t="$el" 'BEGIN { printf "%.0f", (t > 0 ? b / t : 0) }')")"
+
+  if [ $VERIFY = 1 ]; then verify_all || vfail=1; fi
   [ "$nfail" = 0 ] && [ $vfail = 0 ]
 }
 
@@ -444,10 +1064,9 @@ cleanup_parts() {
   "$ADB" shell "$cmd" </dev/null >/dev/null 2>&1
 }
 
-ADB=${ADB:-adb}
+ADB=${ADB:-}
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 case ${1:-} in
   __job) shift; job "$@"; exit 0 ;;
-  __verify) shift; verify_one "$@"; exit 0 ;;
 esac
 main "$@"
