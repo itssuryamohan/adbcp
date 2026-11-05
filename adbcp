@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+# adbcp - fast copy of large files from macOS to an Android device over adb.
+#
+# Why it beats a plain `adb push`:
+#   * Parallel streams. Unless both sides support adb's `delayed_ack` feature,
+#     every adb stream is stop-and-wait (one packet in flight, then wait for an
+#     OKAY). On a USB 3 link several concurrent streams keep the pipe full.
+#   * Big incompressible files (video, archives) are split into chunks that
+#     stream in parallel straight into their final offsets on the device
+#     (`dd seek=`), written to a .adbcp-part file and renamed into place only
+#     after every chunk landed. No reassembly pass, no half-written files.
+#   * Compression only where it pays off: media/archives go raw, everything
+#     else uses zstd (lz4 if the device lacks zstd).
+#   * Detects a USB 2.0 link (a very common cable problem) and warns; there a
+#     single stream already saturates the wire, so splitting is switched off.
+#   * Largest jobs first, retries on transient failures, free-space check,
+#     resume via --skip-existing, md5 verification, keeps the Mac awake.
+#
+# Works with the stock macOS /bin/bash 3.2. Requires adb in PATH (or $ADB).
+
+set -uo pipefail
+
+VERSION=1.0
+BS=1048576                       # dd block size; chunk offsets are multiples of this
+INCOMPRESSIBLE=' mp4 m4v mkv mov avi webm wmv flv 3gp ts m2ts mts mp3 m4a aac ogg oga opus flac wma wav
+ jpg jpeg png gif webp heic heif avif dng zip 7z rar gz tgz bz2 xz zst lz4 br apk apks xapk aab obb jar
+ dmg pdf epub docx xlsx pptx odt '
+
+usage() {
+  cat <<EOF
+adbcp $VERSION - fast parallel copy to an Android device over adb
+
+usage: adbcp [options] SRC... DEST
+       adbcp --bench [DEST_DIR]
+
+  SRC may be files or directories (copied recursively, .DS_Store and ._* skipped).
+  DEST is a device path; with several sources, a trailing '/', or an existing
+  device directory, sources are copied into it (like cp).
+
+options:
+  -s SERIAL         device to use (default: \$ANDROID_SERIAL or the only device)
+  -j N              parallel streams (default: 4)
+  -z ALGO           compression for whole-file pushes: auto|none|lz4|zstd|brotli
+                    (default: auto = none for media/archives, else zstd)
+  --chunk SIZE      chunk size for split files (default: 128M)
+  --split-min SIZE  split uncompressed files of at least SIZE into parallel chunks
+                    (default: 256M, off on a USB 2.0 link unless given; 0 = always)
+  --no-split        never split files; one stream per file
+  --skip-existing   skip files already on the device with the same size (resume a batch)
+  --verify          compare md5 of every copied file afterwards
+  --force           skip the free-space check
+  --burst           restart the adb server with ADB_BURST_MODE=1 (experimental)
+  --libusb          restart the adb server with the libusb USB backend
+  --bench [DIR]     benchmark single push vs split -j 2/4/8 with a random file in DIR
+                    (default /sdcard/Download); size via --bench-size (default 1G)
+  --dry-run         print the transfer plan and exit
+  -q                quiet: only errors and the final summary
+  -h, --help        this help
+
+--burst/--libusb restart the adb server, which drops other adb sessions.
+Run 'adb kill-server' to go back to defaults.
+
+examples:
+  adbcp movie.mkv /sdcard/Movies/
+  adbcp -j 6 --verify ~/Videos/trip /sdcard/DCIM/
+  adbcp --skip-existing ~/Music /sdcard/        # re-run after an interruption
+EOF
+  exit "${1:-0}"
+}
+
+die()  { printf 'adbcp: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'adbcp: %s\n' "$*" >&2; }
+
+now() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then printf '%s\n' "${EPOCHREALTIME/,/.}"
+  elif command -v perl >/dev/null 2>&1; then perl -MTime::HiRes=time -e 'printf "%.3f\n", time'
+  else date +%s; fi
+}
+
+human() {
+  awk -v b="$1" 'BEGIN { split("B KiB MiB GiB TiB", u, " "); i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    if (i == 1) printf "%d B", b; else printf "%.1f %s", b, u[i] }'
+}
+
+rate() { awk -v b="$1" -v a="$2" -v c="$3" 'BEGIN { t = c - a; if (t < 0.001) t = 0.001; printf "%.1f MiB/s", b / t / 1048576 }'; }
+secs() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", b - a }'; }
+
+parse_size() {
+  printf '%s\n' "$1" | awk '{
+    if (!match($0, /^[0-9]+(\.[0-9]+)?/)) exit 1
+    n = substr($0, 1, RLENGTH); s = toupper(substr($0, RLENGTH + 1)); sub(/I?B$/, "", s)
+    m = (s == "") ? 1 : (s == "K") ? 1024 : (s == "M") ? 1048576 : (s == "G") ? 1073741824 : (s == "T") ? 1099511627776 : -1
+    if (m < 0) exit 1
+    printf "%.0f\n", n * m }'
+}
+
+# Quote a string for the device shell.
+rq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+if [ "$(uname)" = Darwin ]; then
+  STAT_FMT=(/usr/bin/stat -L -f '%z%t%m%t%N')
+  hmd5() { /sbin/md5 -q "$1"; }
+else
+  STAT_FMT=(stat -L --printf '%s\t%Y\t%n\n')
+  hmd5() { md5sum "$1" | cut -d' ' -f1; }
+fi
+
+has_feat() { printf '%s\n' "$FEATURES" | grep -qx "$1"; }
+
+# Prints the adb push compression flags for a local file.
+comp_flags() {
+  local algo=$COMP ext
+  if [ "$algo" = auto ]; then
+    ext=$(printf '%s' "${1##*.}" | tr 'A-Z' 'a-z')
+    case $INCOMPRESSIBLE in *[[:space:]]"$ext"[[:space:]]*) algo=none ;; *) algo=$AUTO_ALGO ;; esac
+  fi
+  if [ "$algo" = none ]; then echo -Z; else echo "-z $algo"; fi
+}
+
+# ---------------------------------------------------------------- workers ---
+# Run by xargs, one process per job: BYTES KIND LOCAL REMOTE SKIP COUNT
+# KIND is "push" (whole file via adb push) or "chunkI/N" (dd region into REMOTE.adbcp-part).
+job() {
+  local bytes=$1 kind=$2 src=$3 dst=$4 skip=$5 count=$6
+  local t0 t1 try err="" rcmd label done_bytes
+  t0=$(now)
+  if [ "$kind" != push ]; then
+    rcmd="o=\$(dd of=$(rq "$dst.adbcp-part") bs=$BS seek=$skip conv=notrunc 2>&1) || { echo \"\$o\" >&2; exit 1; }"
+  fi
+  for try in 1 2 3; do
+    if [ "$kind" = push ] && [ -n "$ADBCP_NATIVE" ]; then
+      "$ADB" push $(comp_flags "$src") "$src" "$dst" && break
+    elif [ "$kind" = push ]; then
+      err=$("$ADB" push -q $(comp_flags "$src") "$src" "$dst" 2>&1 >/dev/null) && break
+    else
+      err=$( { dd if="$src" bs=$BS skip="$skip" count="$count" 2>/dev/null | "$ADB" shell -T "$rcmd"; } 2>&1 >/dev/null ) && break
+    fi
+    if [ $try -eq 3 ]; then
+      printf 'adbcp: FAILED %s (%s): %s\n' "$dst" "$kind" "$err" >&2
+      printf '%s\n' "$dst" >> "$ADBCP_TMP/failed"
+      exit 1
+    fi
+    sleep 2
+  done
+  t1=$(now)
+  printf '%s\n' "$bytes" >> "$ADBCP_TMP/done"
+  [ -n "$ADBCP_QUIET$ADBCP_NATIVE" ] && exit 0
+  done_bytes=$(awk '{ s += $1 } END { printf "%.0f", s }' "$ADBCP_TMP/done")
+  label=${dst##*/}; [ "$kind" = push ] || label="$label [${kind#chunk}]"
+  printf '[%3d%% %10s / %-10s %13s]  %s  %s in %ss\n' \
+    $((ADBCP_TOTAL > 0 ? done_bytes * 100 / ADBCP_TOTAL : 100)) "$(human "$done_bytes")" "$(human "$ADBCP_TOTAL")" \
+    "$(rate "$done_bytes" "$ADBCP_T0" "$t1")" "$label" "$(human "$bytes")" "$(secs "$t0" "$t1")" >&2
+}
+
+verify_one() {
+  local src=$1 dst=$2 h d tmp="$ADBCP_TMP/md5.$$"
+  hmd5 "$src" > "$tmp" &
+  d=$("$ADB" shell md5sum "$(rq "$dst")" </dev/null 2>/dev/null | tr -d '\r' | awk '{ print $1 }')
+  wait; h=$(cat "$tmp"); rm -f "$tmp"
+  if [ -n "$d" ] && [ "$h" = "$d" ]; then
+    [ -n "$ADBCP_QUIET" ] || printf 'verified  %s\n' "$dst" >&2
+  else
+    printf 'adbcp: MISMATCH %s (host %s, device %s)\n' "$dst" "$h" "${d:-unreadable}" >&2
+    exit 1
+  fi
+}
+
+# ------------------------------------------------------------------- setup ---
+restart_server() {
+  local st vars=""
+  st=$("$ADB" server-status 2>/dev/null)
+  [ $BURST = 1 ] && vars="$vars ADB_BURST_MODE=1"
+  [ $LIBUSB = 1 ] && vars="$vars ADB_LIBUSB=1"
+  if { [ $BURST = 0 ] || printf '%s' "$st" | grep -q 'burst_mode: true'; } &&
+     { [ $LIBUSB = 0 ] || printf '%s' "$st" | grep -q 'usb_backend: LIBUSB'; }; then
+    return
+  fi
+  warn "restarting adb server with$vars (other adb sessions will drop)"
+  "$ADB" kill-server >/dev/null 2>&1
+  env $vars "$ADB" start-server >/dev/null 2>&1 || die "adb start-server failed"
+  local i=0
+  while [ $i -lt 20 ] && [ "$("$ADB" get-state 2>/dev/null)" != device ]; do sleep 0.5; i=$((i + 1)); done
+}
+
+connect() {
+  local state
+  command -v "$ADB" >/dev/null 2>&1 || die "adb not found (install: brew install android-platform-tools)"
+  [ $BURST = 1 ] || [ $LIBUSB = 1 ] && restart_server
+  state=$("$ADB" get-state 2>&1) || die "$state"
+  [ "$state" = device ] || die "device state is '$state' (authorize the computer on the device?)"
+  ANDROID_SERIAL=$("$ADB" get-serialno | tr -d '\r'); export ANDROID_SERIAL
+  FEATURES=$("$ADB" features 2>/dev/null | tr ',' '\n' | tr -d '\r')
+  case $ANDROID_SERIAL in *:*|*._tcp*|*adb-tls*) TRANSPORT=tcp ;; *) TRANSPORT=usb ;; esac
+  LINK="" SLOW_LINK=0
+  if [ $TRANSPORT = usb ] && command -v ioreg >/dev/null 2>&1; then
+    LINK=$(ioreg -p IOUSB -l -w0 2>/dev/null | awk -v s="$ANDROID_SERIAL" '
+      function flush() { if (ser == s && spd != "") { print spd; found = 1; exit } ser = ""; spd = "" }
+      /\+-o / { flush() }
+      /"USB Serial Number" = / { v = $0; sub(/.*= "/, "", v); sub(/".*/, "", v); ser = v }
+      /"UsbLinkSpeed" = / { v = $0; sub(/.*= /, "", v); spd = v + 0 }
+      END { if (!found) flush() }')
+    if [ -n "$LINK" ] && [ "$LINK" -lt 5000000000 ]; then
+      SLOW_LINK=1
+      [ -n "$QUIET" ] || warn "device is linked at $((LINK / 1000000)) Mb/s (USB 2.0): expect ~40 MB/s raw at best." \
+        "Use a USB 3 data cable and port for 5-10x more."
+    fi
+  fi
+  [ $TRANSPORT = tcp ] && SLOW_LINK=1
+  # zstd beat lz4 everywhere measured (USB 2.0: 3x vs 2.2x; USB 3, 8 streams of game
+  # data: 386 vs 333 MiB/s) and costs only ~6% on incompressible data.
+  if has_feat sendrecv_v2_zstd; then AUTO_ALGO=zstd
+  elif has_feat sendrecv_v2_lz4; then AUTO_ALGO=lz4
+  else AUTO_ALGO=none; fi
+}
+
+bench() {
+  local size dir t0 t1 j chunk best="" best_rate=0 out
+  size=$BENCH_SIZE; dir=${1:-/sdcard/Download}
+  connect
+  BTMP=$(mktemp -d "${TMPDIR:-/tmp}/adbcp-bench.XXXXXX") || die "mktemp failed"
+  BF=$BTMP/adbcp-bench.bin; BR=${dir%/}/.adbcp-bench.bin
+  trap 'rm -rf "$BTMP"; "$ADB" shell rm -f "$(rq "$BR")" "$(rq "$BR.adbcp-part")" /data/local/tmp/adbcp-bench.bin >/dev/null 2>&1' EXIT
+  printf 'adbcp: writing %s of random data...\n' "$(human "$size")" >&2
+  dd if=/dev/urandom of="$BF" bs=$BS count=$((size / BS)) 2>/dev/null || die "cannot create test file"
+  printf '\ndevice %s (%s), delayed_ack: %s, burst: %s\n\n' "$ANDROID_SERIAL" "$TRANSPORT" \
+    "$(has_feat delayed_ack && echo yes || echo no)" \
+    "$("$ADB" server-status 2>/dev/null | grep -q 'burst_mode: true' && echo on || echo off)"
+  run() {
+    local label=$1; shift
+    t0=$(now); "$@" >/dev/null 2>&1; local rc=$?; t1=$(now)
+    if [ $rc -ne 0 ]; then printf '  %-36s failed\n' "$label"; return; fi
+    out=$(awk -v b="$size" -v a="$t0" -v c="$t1" 'BEGIN { printf "%.1f", b / (c - a) / 1048576 }')
+    printf '  %-36s %6ss  %8s MiB/s\n' "$label" "$(secs "$t0" "$t1")" "$out"
+    case $label in link*) return ;; esac
+    if awk -v x="$out" -v y="$best_rate" 'BEGIN { exit !(x > y) }'; then best=$label; best_rate=$out; fi
+  }
+  has_feat sendrecv_v2_dry_run_send &&
+    run "link only (push -n, not stored)" "$ADB" push -q -n -Z "$BF" /data/local/tmp/adbcp-bench.bin
+  run "adb push, 1 stream" "$ADB" push -q -Z "$BF" "$BR"
+  for j in 2 4 8; do
+    chunk=$((size / j / 2 / BS * BS)); [ $chunk -ge $((16 * BS)) ] || chunk=$((16 * BS))
+    run "adbcp -j $j (split, $(human $chunk) chunks)" \
+      "$BASH" "$SELF" -q -z none -j $j --split-min 0 --chunk $chunk --force "$BF" "$BR"
+  done
+  printf '\nfastest: %s\n' "${best:-none}"
+}
+
+# -------------------------------------------------------------------- main ---
+main() {
+  J=4 COMP=auto CHUNK=$((128 * BS)) SPLIT_MIN=$((256 * BS)) NO_SPLIT=0 VERIFY=0
+  SPLIT_SET=0 SKIP_EXISTING=0 DRY=0 QUIET="" FORCE=0 BURST=0 LIBUSB=0 BENCH=0 BENCH_SIZE=$((1024 * BS))
+  local args=() a
+  while [ $# -gt 0 ]; do
+    case $1 in -s|-j|-z|--chunk|--split-min|--bench-size)
+      [ $# -ge 2 ] || die "option $1 needs a value" ;;
+    esac
+    case $1 in
+      -s) ANDROID_SERIAL=$2; export ANDROID_SERIAL; shift ;;
+      -j) J=$2; shift ;;
+      -z) COMP=$2; shift ;;
+      --chunk) CHUNK=$(parse_size "$2") || die "bad size: $2"; shift ;;
+      --split-min) SPLIT_MIN=$(parse_size "$2") || die "bad size: $2"; SPLIT_SET=1; shift ;;
+      --bench-size) BENCH_SIZE=$(parse_size "$2") || die "bad size: $2"; shift ;;
+      --no-split) NO_SPLIT=1 ;;
+      --skip-existing) SKIP_EXISTING=1 ;;
+      --verify) VERIFY=1 ;;
+      --force) FORCE=1 ;;
+      --burst) BURST=1 ;;
+      --libusb) LIBUSB=1 ;;
+      --bench) BENCH=1 ;;
+      --dry-run) DRY=1 ;;
+      -q) QUIET=1 ;;
+      -h|--help) usage 0 ;;
+      -V|--version) echo "adbcp $VERSION"; exit 0 ;;
+      --) shift; break ;;
+      -?*) die "unknown option: $1 (see --help)" ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+  set -- ${args[@]+"${args[@]}"} "$@"
+
+  case $J in ''|*[!0-9]*|0) die "-j needs a positive integer" ;; esac
+  case $COMP in auto|none|any|lz4|zstd|brotli) ;; *) die "unknown compression: $COMP" ;; esac
+  CHUNK=$(( (CHUNK + BS - 1) / BS * BS )); [ $CHUNK -gt 0 ] || CHUNK=$BS
+  BENCH_SIZE=$(( (BENCH_SIZE + BS - 1) / BS * BS ))
+  [ $BENCH = 1 ] && { bench "$@"; exit; }
+  [ $# -ge 2 ] || usage 1
+
+  local dest=${!#} n=$(($# - 1)) dest_is_dir=0
+  set -- "${@:1:$n}"
+  case $dest in */) dest_is_dir=1 ;; esac
+  while [ "$dest" != / ] && [ "${dest%/}" != "$dest" ]; do dest=${dest%/}; done
+  [ $n -gt 1 ] && dest_is_dir=1
+  case $dest in /*) ;; *) die "DEST must be an absolute device path, e.g. /sdcard/Download/" ;; esac
+
+  connect
+  [ $dest_is_dir = 1 ] ||
+    [ "$("$ADB" shell "[ -d $(rq "$dest") ] && echo y" </dev/null 2>/dev/null | tr -d '\r')" = y ] && dest_is_dir=1
+
+  ADBCP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/adbcp.XXXXXX") || die "mktemp failed"
+  T=$ADBCP_TMP finished=0
+  : > "$T/files"; : > "$T/jobs"; : > "$T/split"; : > "$T/done"; : > "$T/failed"
+  trap 'rc=$?; [ $finished = 1 ] || [ ! -s "$T/split" ] || cleanup_parts; rm -rf "$T"; exit $rc' EXIT
+  # Take down xargs, workers and adb clients too (works when we lead our process group, as from a terminal).
+  trap 'trap "" INT TERM; kill -TERM -- -$$ 2>/dev/null; exit 130' INT TERM
+
+  # File list: SIZE \t MTIME \t LOCAL \t REMOTE
+  local src root base
+  for src in "$@"; do
+    while [ "$src" != / ] && [ "${src%/}" != "$src" ]; do src=${src%/}; done
+    if [ -d "$src" ]; then
+      base=${src##*/}
+      case $base in ''|.|..) base=$(cd "$src" && basename "$PWD") ;; esac
+      if [ $dest_is_dir = 1 ]; then root=$dest/$base; else root=$dest; fi
+      find -L "$src" -type f ! -name .DS_Store ! -name '._*' ! -name $'*\t*' ! -name $'*\n*' -print0 |
+        xargs -0 "${STAT_FMT[@]}" |
+        SRC=$src ROOT=$root awk -F'\t' 'BEGIN { OFS = "\t"; n = length(ENVIRON["SRC"]) + 2 }
+          { print $1, $2, $3, ENVIRON["ROOT"] "/" substr($3, n) }' >> "$T/files"
+    elif [ -f "$src" ]; then
+      if [ $dest_is_dir = 1 ]; then root=$dest/${src##*/}; else root=$dest; fi
+      "${STAT_FMT[@]}" "$src" | ROOT=$root awk -F'\t' 'BEGIN { OFS = "\t" } { print $1, $2, $3, ENVIRON["ROOT"] }' >> "$T/files"
+    else
+      die "no such file or directory: $src"
+    fi
+  done
+  [ -s "$T/files" ] || die "nothing to copy"
+
+  if [ $SKIP_EXISTING = 1 ]; then
+    if has_feat shell_v2; then
+      local before after
+      before=$(wc -l < "$T/files")
+      cut -f4 "$T/files" | "$ADB" shell -T \
+        'while IFS= read -r f; do s=$(stat -c %s "$f" 2>/dev/null) && echo "$s $f"; done' > "$T/remote" 2>/dev/null
+      awk -F'\t' 'FILENAME == ARGV[1] { p = $0; sub(/^[0-9]+ /, "", p); have[p] = $0 + 0; next }
+        !(($4 in have) && have[$4] == $1)' "$T/remote" "$T/files" > "$T/files.new"
+      mv "$T/files.new" "$T/files"
+      after=$(wc -l < "$T/files")
+      [ -n "$QUIET" ] || [ $before -eq $after ] || warn "skipping $((before - after)) file(s) already on the device"
+      [ -s "$T/files" ] || { [ -n "$QUIET" ] || warn "nothing to do"; finished=1; exit 0; }
+    else
+      warn "--skip-existing needs shell_v2 on the device; ignored"
+    fi
+  fi
+
+  # Jobs: BYTES \t KIND \t LOCAL \t REMOTE \t SKIP \t COUNT
+  local split_ok=0 size mtime dst blocks nch k skip bytes cb=$((CHUNK / BS)) total=0 nfiles=0
+  [ $NO_SPLIT = 0 ] && [ $J -gt 1 ] && has_feat shell_v2 && split_ok=1
+  # A saturated link gains nothing from more streams; compression helps instead.
+  [ $SLOW_LINK = 1 ] && [ $SPLIT_SET = 0 ] && split_ok=0
+  while IFS=$'\t' read -r size mtime src dst; do
+    total=$((total + size)); nfiles=$((nfiles + 1))
+    # Split streams can't compress, so only incompressible files are split.
+    if [ $split_ok = 1 ] && [ "$size" -ge "$SPLIT_MIN" ] && [ "$size" -gt "$CHUNK" ] &&
+       [ "$(comp_flags "$src")" = -Z ]; then
+      blocks=$(( (size + BS - 1) / BS )); nch=$(( (blocks + cb - 1) / cb )); k=0
+      while [ $k -lt $nch ]; do
+        skip=$((k * cb)); bytes=$CHUNK
+        [ $k -eq $((nch - 1)) ] && bytes=$((size - skip * BS))
+        printf '%s\tchunk%s/%s\t%s\t%s\t%s\t%s\n' "$bytes" $((k + 1)) "$nch" "$src" "$dst" "$skip" "$cb" >> "$T/jobs"
+        k=$((k + 1))
+      done
+      printf '%s\t%s\t%s\t%s\n' "$size" "$mtime" "$src" "$dst" >> "$T/split"
+    else
+      printf '%s\tpush\t%s\t%s\t0\t0\n' "$size" "$src" "$dst" >> "$T/jobs"
+    fi
+  done < "$T/files"
+  sort -t "$(printf '\t')" -k1,1nr -o "$T/jobs" "$T/jobs"
+  local njobs workers
+  njobs=$(wc -l < "$T/jobs" | tr -d ' ')
+  workers=$J; [ "$njobs" -lt "$workers" ] && workers=$njobs
+
+  if [ -z "$QUIET" ] || [ $DRY = 1 ]; then
+    printf 'adbcp: %s (%s, delayed_ack %s) | %d file(s), %s | %d job(s) on %d stream(s) | compression %s\n' \
+      "$ANDROID_SERIAL" "$TRANSPORT" "$(has_feat delayed_ack && echo yes || echo no)" "$nfiles" "$(human $total)" \
+      "$njobs" "$workers" "$([ "$COMP" = auto ] && echo "auto/$AUTO_ALGO" || echo "$COMP")" >&2
+  fi
+  if [ $DRY = 1 ]; then
+    awk -F'\t' '{ printf "  %-10s %12d B  %s -> %s\n", $2, $1, $3, $4 }' "$T/jobs"
+    finished=1; exit 0
+  fi
+
+  if [ $FORCE = 0 ]; then
+    local avail
+    avail=$("$ADB" shell "d=$(rq "$dest"); while [ -n \"\$d\" ] && [ ! -d \"\$d\" ]; do d=\${d%/*}; done; df -k \"\${d:-/}\"" </dev/null 2>/dev/null |
+      tr -d '\r' | awk 'NR > 1 && NF >= 4 { a = $(NF - 2) } END { printf "%.0f", a * 1024 }')
+    if [ "${avail:-0}" -gt 0 ] && [ "$total" -gt "$avail" ]; then
+      die "not enough space on device: need $(human $total), $(human "$avail") free (use --force to try anyway)"
+    fi
+  fi
+
+  if [ -s "$T/split" ]; then
+    local prep=""
+    while IFS=$'\t' read -r size mtime src dst; do
+      prep="$prep mkdir -p $(rq "${dst%/*}") && rm -f $(rq "$dst.adbcp-part") || exit 1;"
+    done < "$T/split"
+    "$ADB" shell "$prep" </dev/null || die "cannot prepare destination on device"
+  fi
+
+  ADBCP_NATIVE=""
+  [ "$njobs" = 1 ] && [ -z "$QUIET" ] && [ -t 1 ] && [ ! -s "$T/split" ] && ADBCP_NATIVE=1
+  ADBCP_T0=$(now) ADBCP_TOTAL=$total ADBCP_QUIET=$QUIET
+  export ADB ADBCP_TMP ADBCP_T0 ADBCP_TOTAL ADBCP_QUIET ADBCP_NATIVE COMP AUTO_ALGO
+  command -v caffeinate >/dev/null 2>&1 && { caffeinate -i -w $$ >/dev/null 2>&1 & }
+
+  tr '\t\n' '\0\0' < "$T/jobs" | xargs -0 -n 6 -P "$workers" "$BASH" "$SELF" __job
+
+  # Move completed split files into place.
+  local res
+  while IFS=$'\t' read -r size mtime src dst; do
+    local p d; p=$(rq "$dst.adbcp-part"); d=$(rq "$dst")
+    if grep -Fxq -- "$dst" "$T/failed"; then
+      "$ADB" shell "rm -f $p" </dev/null >/dev/null 2>&1; continue
+    fi
+    res=$("$ADB" shell "s=\$(stat -c %s $p) && [ \"\$s\" = $size ] && mv -f $p $d && { touch -m -d @$mtime $d 2>/dev/null; echo ok; } || echo \"size \$s, expected $size\"" </dev/null 2>&1 | tr -d '\r' | tail -n 1)
+    if [ "$res" != ok ]; then
+      warn "FAILED to finalize $dst: $res"
+      printf '%s\n' "$dst" >> "$T/failed"
+      "$ADB" shell "rm -f $p" </dev/null >/dev/null 2>&1
+    fi
+  done < "$T/split"
+  finished=1
+
+  local t1 nfail done_bytes vfail=0
+  t1=$(now)
+  done_bytes=$(awk '{ s += $1 } END { printf "%.0f", s }' "$T/done")
+  nfail=$(sort -u "$T/failed" | wc -l | tr -d ' ')
+  printf 'adbcp: %d/%d file(s), %s in %ss, %s\n' $((nfiles - nfail)) "$nfiles" "$(human "$done_bytes")" \
+    "$(secs "$ADBCP_T0" "$t1")" "$(rate "$done_bytes" "$ADBCP_T0" "$t1")" >&2
+
+  if [ $VERIFY = 1 ]; then
+    cut -f3,4 "$T/files" | while IFS=$'\t' read -r src dst; do
+      grep -Fxq -- "$dst" "$T/failed" || printf '%s\0%s\0' "$src" "$dst"
+    done | xargs -0 -n 2 -P "$J" "$BASH" "$SELF" __verify || vfail=1
+    [ $vfail = 0 ] && warn "all copied files verified"
+  fi
+  [ "$nfail" = 0 ] && [ $vfail = 0 ]
+}
+
+cleanup_parts() {
+  local cmd="" size mtime src dst
+  while IFS=$'\t' read -r size mtime src dst; do cmd="$cmd rm -f $(rq "$dst.adbcp-part");"; done < "$T/split"
+  "$ADB" shell "$cmd" </dev/null >/dev/null 2>&1
+}
+
+ADB=${ADB:-adb}
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+case ${1:-} in
+  __job) shift; job "$@"; exit 0 ;;
+  __verify) shift; verify_one "$@"; exit 0 ;;
+esac
+main "$@"
