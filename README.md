@@ -94,7 +94,24 @@ panes can make folders, rename and delete (on the Mac to the Trash; on the phone
 permanently, after asking). Copies queue up, and a transfer bar shows progress, speed,
 time left and any problems. Settings, measurements and the last folders are remembered.
 
-There are no prebuilt downloads; build it yourself:
+### Download
+
+GitHub builds the app for each version tag on `main`, and when someone starts the build
+by hand (see `.github/workflows/build.yml`). The app runs on Apple Silicon and Intel Macs.
+
+- **Releases:** each tagged version has a zip on the repository's Releases page.
+- **Builds started by hand:** open the Actions tab, pick a successful "Build" run, and
+  download the zip under Artifacts. You need to be signed in to GitHub for this.
+
+The app is not signed by Apple, so macOS blocks it the first time:
+
+1. Unzip it and move `adbcp.app` to Applications.
+2. Open it. macOS says it cannot check the app. Press **Done**.
+3. Open **System Settings > Privacy & Security** and press **Open Anyway** next to adbcp.
+
+To skip these steps, run `xattr -dr com.apple.quarantine /Applications/adbcp.app`.
+
+### Build it yourself
 
 ```bash
 # Once: Rust (https://rustup.rs) and Node.js are needed
@@ -104,11 +121,13 @@ npm run build                    # needs ~/.cargo/bin on your PATH
 open src-tauri/target/release/bundle/macos/adbcp.app
 ```
 
-The app is about 3 MB. It does not include Google's adb: it uses the one already on
+For a build that also runs on Intel Macs, run `rustup target add x86_64-apple-darwin`
+once, then `npm run build -- --target universal-apple-darwin`.
+
+The app is about 3 MB (6.6 MB for the Apple Silicon and Intel build). It does not include Google's adb: it uses the one already on
 your Mac (from your PATH, Homebrew or Android Studio), and otherwise asks before
 downloading Google's official package (about 16 MB, once, signature-checked). It is
-not signed by Apple, which is fine for an app you build yourself; sharing it with
-others would need signing and notarization. The current build runs on Apple Silicon Macs.
+not signed or notarized by Apple. The build gives it an ad-hoc signature only.
 
 ## Before you use it
 
@@ -139,6 +158,7 @@ These are not bugs, but they can surprise you:
 
 ```
 adbcp            the copy engine (one bash script)
+.github/         GitHub workflow that builds the app
 SPEC.md          engine specification
 app/             desktop app (Tauri 2: Rust + HTML/CSS/JavaScript)
   SPEC.md        app specification

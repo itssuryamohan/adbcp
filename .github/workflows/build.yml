@@ -1,0 +1,102 @@
+# Builds the macOS app on GitHub's free macOS runner. It runs only:
+# - On demand (Actions tab > Build > Run workflow): check the engine, build the app,
+#   keep the zip as a workflow artifact (about 14 days).
+# - When a tag like v0.3.0 is pushed: the same, then attach the zip to a GitHub
+#   release. The tagged commit must be on main, otherwise the build stops.
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Make sure the tag is on main
+        if: github.ref_type == 'tag'
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME is not on main. Tag a commit on main instead."
+            exit 1
+          fi
+
+      # The engine must run on the bash 3.2 that ships with macOS.
+      - name: Check the engine
+        run: |
+          /bin/bash -n adbcp
+          ./adbcp --help > /dev/null
+          ADBCP_NO_DOWNLOAD=1 ./adbcp --adb-status --json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - name: Build the app (Apple Silicon and Intel)
+        working-directory: app
+        run: |
+          npm ci
+          npm run build -- --target universal-apple-darwin
+
+      - name: Zip the app
+        id: zip
+        run: |
+          version=$(node -p "require('./app/src-tauri/tauri.conf.json').version")
+          app=app/src-tauri/target/universal-apple-darwin/release/bundle/macos/adbcp.app
+          codesign --verify --deep --strict "$app"
+          lipo -archs "$app/Contents/MacOS/adbcp-app"
+          zip="adbcp-$version-macos-universal.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$zip"
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.zip.outputs.zip }}
+          path: ${{ steps.zip.outputs.zip }}
+          if-no-files-found: error
+
+    outputs:
+      zip: ${{ steps.zip.outputs.zip }}
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.macos.outputs.zip }}
+
+      - name: Attach the zip to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "${{ needs.macos.outputs.zip }}" \
+            --title "adbcp $GITHUB_REF_NAME" --generate-notes \
+          || gh release upload "$GITHUB_REF_NAME" "${{ needs.macos.outputs.zip }}" --clobber

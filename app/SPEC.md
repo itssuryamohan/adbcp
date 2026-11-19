@@ -251,6 +251,27 @@ PATH="$HOME/.cargo/bin:$PATH" npm run build
 open src-tauri/target/release/bundle/macos/adbcp.app
 ```
 
+For Apple Silicon and Intel in one app, add the Intel target once and build for both:
+
+```bash
+rustup target add x86_64-apple-darwin
+npm run build -- --target universal-apple-darwin
+open src-tauri/target/universal-apple-darwin/release/bundle/macos/adbcp.app
+```
+
+The build signs the app ad-hoc (`signingIdentity: "-"`). This seals the bundle, so
+macOS offers "Open Anyway" for a downloaded copy instead of saying it is damaged. It is
+not an Apple signature and not notarized.
+
+GitHub builds the universal app on its free macOS runner (`.github/workflows/build.yml`):
+
+- It runs only on demand (Actions tab > Build > Run workflow) or when a tag such as
+  `v0.3.0` is pushed. Pushes to branches and pull requests do not start it.
+- Each run checks the engine with macOS's bash 3.2, builds the app and keeps a zip as
+  a workflow artifact.
+- For a tag, the tagged commit must be on `main`, otherwise the build stops. Then the
+  zip is attached to a GitHub release.
+
 `npm run dev` runs the app straight from the sources. Setting `ADBCP_ENGINE` to a path
 makes the app use that engine instead of the bundled one.
 
@@ -291,8 +312,8 @@ download dialog's buttons (including opening Google's terms). These need a perso
 
 - Copying within one side (Mac to Mac or phone to phone), and moving instead of copying.
 - Reordering or removing copies that are waiting in the queue.
-- Distribution to other people: signing and notarization by Apple.
-- A build that also runs on Intel Macs (today: Apple Silicon only).
+- Signing and notarization by Apple (needs a paid Apple Developer account).
+- The Intel half of the universal build is not tested on an Intel Mac yet.
 - A Linux build.
 
 ## 7. Decisions and open questions
