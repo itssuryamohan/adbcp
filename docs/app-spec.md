@@ -78,6 +78,24 @@ Settings shows which adb the app uses and where it came from.
 - A phone that is not ready shows in the list with the reason, such as "allow this computer on the phone" or "offline". The user cannot select it.
 - Without a ready phone, the phone pane tells the user what to do: the cable, *USB debugging*, and allowing the computer.
 - A note shows when the phone uses a USB 2.0 connection.
+- A phone on Wi-Fi shows as "SM-S918B · Wi-Fi".
+
+**Wi-Fi (Wireless debugging).** **Wi-Fi…** next to **Refresh** opens a sheet:
+
+1. The sheet shows a QR code with the text `WIFI:T:ADB;S:<name>;P:<password>;;`. The window makes a random name (`adbcp-` and 8 characters) and a random 12-character password each time.
+2. The user turns on **Developer options > Wireless debugging** on the phone, taps **Pair device with QR code**, and scans the code.
+3. The phone then offers a pairing service with that name on the network. The window looks for it every 1.5 seconds (`wifi_scan`).
+4. When the service appears, the window pairs with the password (`wifi_op pair`).
+5. The phone then offers its connect service on the same IP address. adb often connects by itself. If it has not after about 3 seconds, the window connects (`wifi_op connect`).
+6. The window selects the phone and opens it in the phone pane. It makes a new QR code for the next phone.
+
+**Pair with a code instead** takes the IP address and port, and the 6-digit code, from
+the phone's **Pair device with pairing code** screen. The window fills in the address
+when it finds the phone's pairing service.
+
+**Phones on this network** lists each phone that offers Wireless debugging, and each
+phone connected over Wi-Fi. Each row has **Connect** or **Disconnect**. Connect works only
+for a phone that was paired with this Mac before.
 
 ### 3.2 The two panes
 
@@ -251,6 +269,9 @@ The Rust core (`src-tauri/src/main.rs`) gives the window these commands:
 | `get_adb` | Runs `adbcp --get-adb --json`. The window calls it only after the user agrees to the download. |
 | `open_adb_terms` | Opens Google's Platform-Tools page (a fixed address) in the browser |
 | `list_devices` | Runs `adbcp --devices --json` |
+| `wifi_scan` | Runs `adbcp --wifi-scan --json`: phones that offer Wireless debugging on the network |
+| `wifi_op` | Runs `adbcp --wifi-pair`, `--wifi-connect`, or `--wifi-disconnect` |
+| `qr_svg` | Makes the pairing QR code as an SVG image (the `qrcode` Rust crate) |
 | `list_dir` | Runs `adbcp -s SERIAL --ls PATH --json`, for the phone pane |
 | `list_local` | Lists a folder on the Mac, for the Mac pane |
 | `local_places` | Returns Home, Desktop, Documents, Downloads, Movies, Music, Pictures, and external drives |
@@ -290,6 +311,9 @@ adb by itself. Only `get_adb` downloads adb, after the user agrees.
 - The window cannot give arbitrary options to the engine. The Rust core makes the command from typed fields.
 - The engine runs in its own *process group*. Cancel or quit stops every transfer that the engine started.
 - A content security policy lets the window load only its own files.
+- The app's `Info.plist` has `NSLocalNetworkUsageDescription` and `NSBonjourServices`
+  (`_adb-tls-pairing._tcp`, `_adb-tls-connect._tcp`, `_adb._tcp`). macOS asks the user
+  before adb, started by the app, can look for phones on the local network.
 
 ## 5. Building and testing
 
@@ -378,11 +402,15 @@ The test hook uses the normal window logic. Thus it also writes the settings fil
 | The window rendered in the Mac's web engine, with test Mac and phone folders and engine events, in light and dark mode. States: two panes with a selection; the name-clash dialog; a copy with a waiting copy; a drag with the drop target highlighted; a finished copy with a name problem and "Copy with safe names"; the phone delete confirmation; settings; Finder drops accepted on the phone pane and refused on the Mac pane; no phone | Correct after two fixes (the Places menu, the refresh symbol) |
 | Engine phone operations on the device: new folder, rename, delete. Refusals: an existing name, a missing item, a rename onto an existing name. The exact argument order of the app | All correct |
 | The delete guard: `/`, `/sdcard` (with and without a trailing `/`), DCIM, Download, `/storage/emulated/0` and its Download, Android, Android/data, `/data/local/tmp`, `/system`, a one-level path, a path with `..`, a relative path | All refused before anything reached the phone |
+| Engine Wi-Fi commands on the S23 Ultra: scan found the phone's connect service; `--wifi-connect` connected; `--wifi-disconnect` disconnected; a bad address was refused before it reached adb | All correct |
+| Copy over Wi-Fi, both directions, with verify (300 MiB file and 100 small files) | Identical. 16.0 MiB/s with Wi-Fi splitting, against 8.2 MiB/s before |
+| Rendered: the Wi-Fi sheet with the QR code, the code fallback with a connected phone, the window after **Done** with "SM-S918B · Wi-Fi" selected | As intended |
 | Engine features from earlier versions: measurements, safe names, verify, resume, cancel | See the git history of this file. This version did not change them. |
 
 These items need a person at the Mac. Nobody has tested them by hand in the real window yet:
 
 - Clicks and keyboard use.
+- QR code pairing on a real phone, and the macOS local-network prompt.
 - Drags between the panes and from Finder.
 - The Trash on the Mac.
 - Measure now.

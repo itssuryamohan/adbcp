@@ -21,6 +21,9 @@ const ui = {
   dialog: $('dialog'), dialogTitle: $('dialog-title'), dialogText: $('dialog-text'), dialogList: $('dialog-list'),
   dialogInput: $('dialog-input'), dialogError: $('dialog-error'), dialogButtons: $('dialog-buttons'),
   ghost: $('drag-ghost'),
+  wifi: $('wifi'), wifiSheet: $('wifi-sheet'), wifiClose: $('wifi-close'), wifiQr: $('wifi-qr'),
+  wifiStatus: $('wifi-status'), wifiAddr: $('wifi-addr'), wifiPin: $('wifi-pin'), wifiPair: $('wifi-pair'),
+  wifiList: $('wifi-list'),
 };
 
 const PHONE_PLACES = [
@@ -214,7 +217,7 @@ function deviceLabel(d) {
   const name = d.model || d.serial;
   if (d.state === 'unauthorized') return `${name} · allow this computer on the phone`;
   if (d.state !== 'device') return `${name} · ${d.state}`;
-  if (d.connection !== 'usb') return `${name} · network`;
+  if (d.connection !== 'usb') return `${name} · Wi-Fi`;
   if (!d.link_mbps) return `${name} · USB`;
   return `${name} · USB ${d.link_mbps >= 1000 ? d.link_mbps / 1000 + ' Gb/s' : d.link_mbps + ' Mb/s'}`;
 }
@@ -252,6 +255,178 @@ async function refreshDevices() {
   await loadPane(panes.phone, panes.phone.path);
 }
 
+// --------------------------------------------------------------------- Wi-Fi ---
+// Wireless debugging setup. The sheet shows a QR code that the phone scans in
+// Developer options › Wireless debugging › Pair device with QR code. The phone then
+// offers a pairing service named after the code; the window finds it, pairs with the
+// password from the code, and connects. "Pair with a code" does the same with the
+// address and 6-digit code that the phone shows.
+const wifi = { open: false, name: '', password: '', timer: 0, busy: false, pairing: false, services: [], devices: [] };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function token(n, chars) {
+  const a = new Uint32Array(n);
+  crypto.getRandomValues(a);
+  return [...a].map((x) => chars[x % chars.length]).join('');
+}
+function setWifiStatus(text, ok) {
+  ui.wifiStatus.textContent = text;
+  ui.wifiStatus.className = 'wifi-status' + (ok === true ? ' ok' : ok === false ? ' bad' : '');
+}
+async function wifiScan() {
+  return (await invoke('wifi_scan')).filter((e) => e.event === 'wifi_service');
+}
+// A connect service is connected when adb lists it by address or by its mDNS name.
+const wifiDeviceFor = (svc, devices) =>
+  devices.find((d) => d.connection !== 'usb' && (d.serial === svc.address || d.serial.startsWith(svc.name + '.')));
+
+async function openWifi() {
+  if (!(state.adb && state.adb.found) && !(await ensureAdb())) return;
+  wifi.name = 'adbcp-' + token(8, 'abcdefghijklmnopqrstuvwxyz0123456789');
+  wifi.password = token(12, 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789');
+  try {
+    ui.wifiQr.innerHTML = await invoke('qr_svg', { text: `WIFI:T:ADB;S:${wifi.name};P:${wifi.password};;` });
+  } catch (err) { ui.wifiQr.textContent = String(err); }
+  setWifiStatus('Waiting for the phone to scan the code…');
+  ui.wifiList.innerHTML = '';
+  ui.wifiList.append(el('li', 'empty', 'Looking for phones…'));
+  ui.wifiSheet.hidden = false;
+  wifi.open = true;
+  wifi.pairing = false;
+  wifiTick();
+}
+function closeWifi() {
+  wifi.open = false;
+  clearTimeout(wifi.timer);
+  ui.wifiSheet.hidden = true;
+  refreshDevices();
+}
+async function wifiTick() {
+  if (!wifi.open) return;
+  if (!wifi.busy && !wifi.pairing) {
+    wifi.busy = true;
+    try {
+      wifi.services = await wifiScan();
+      wifi.devices = await invoke('list_devices');
+      const mine = wifi.services.find((s) => s.kind === 'pairing' && s.name === wifi.name);
+      if (mine) await pairAndConnect(mine.address, wifi.password);
+      // The phone's "pairing code" screen announces its address too: fill it in.
+      const other = wifi.services.find((s) => s.kind === 'pairing' && s.name !== wifi.name);
+      if (other && !ui.wifiAddr.value) ui.wifiAddr.value = other.address;
+      renderWifiList();
+    } catch (err) {
+      setWifiStatus(String(err), false);
+    }
+    wifi.busy = false;
+  }
+  if (wifi.open) wifi.timer = setTimeout(wifiTick, 1500);
+}
+async function pairAndConnect(address, code) {
+  wifi.pairing = true;
+  const ip = address.replace(/:\d+$/, '');
+  try {
+    setWifiStatus(`Pairing with ${address}…`);
+    await invoke('wifi_op', { op: 'pair', args: [address, code] });
+    setWifiStatus('Paired. Connecting…');
+    // After pairing, the phone offers its connect service on the same IP address, and
+    // adb often connects by itself. If it has not after a few seconds, connect directly.
+    for (let i = 0; i < 20 && wifi.open; i++) {
+      const services = await wifiScan();
+      const devices = await invoke('list_devices');
+      const svc = services.find((s) => s.kind === 'connect' && s.address.startsWith(ip + ':'));
+      let dev = svc && wifiDeviceFor(svc, devices);
+      if (svc && !dev && i >= 3) {
+        await invoke('wifi_op', { op: 'connect', args: [svc.address] });
+        dev = wifiDeviceFor(svc, await invoke('list_devices'));
+      }
+      if (dev) {
+        setWifiStatus(`Connected: ${dev.model || dev.serial} over Wi-Fi.`, true);
+        await useDevice(dev.serial);
+        return;
+      }
+      await sleep(1000);
+    }
+    setWifiStatus('Paired, but the phone did not appear. Make sure Wireless debugging is still on, then press Connect below.', false);
+  } catch (err) {
+    setWifiStatus(`${err}`, false);
+  } finally {
+    wifi.pairing = false;
+    // A fresh code for the next phone (a pairing code can be used once).
+    wifi.name = 'adbcp-' + token(8, 'abcdefghijklmnopqrstuvwxyz0123456789');
+    wifi.password = token(12, 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789');
+    invoke('qr_svg', { text: `WIFI:T:ADB;S:${wifi.name};P:${wifi.password};;` })
+      .then((svg) => { ui.wifiQr.innerHTML = svg; }).catch(() => {});
+  }
+}
+// Select a phone in the toolbar and open it in the phone pane.
+async function useDevice(serial) {
+  await refreshDevices();
+  if (state.devices.some((d) => d.serial === serial && d.state === 'device')) {
+    ui.device.value = serial;
+    updateControls();
+    await loadPane(panes.phone, panes.phone.path);
+    refreshTuning(true);
+  }
+}
+function renderWifiList() {
+  const rows = [];
+  const usb = wifi.devices.filter((d) => d.connection === 'usb');
+  for (const svc of wifi.services.filter((s) => s.kind === 'connect')) {
+    const dev = wifiDeviceFor(svc, wifi.devices);
+    // "adb-SERIAL-xxxxxx": name it after the phone if it is also on USB.
+    const serial = (svc.name.match(/^adb-(.+)-[^-]+$/) || [])[1];
+    const model = dev?.model || usb.find((d) => d.serial === serial)?.model || serial || svc.name;
+    rows.push({ model, address: svc.address, dev, svc });
+  }
+  for (const d of wifi.devices.filter((x) => x.connection !== 'usb')) {
+    if (!rows.some((r) => r.dev && r.dev.serial === d.serial)) rows.push({ model: d.model || d.serial, address: d.serial, dev: d });
+  }
+  ui.wifiList.innerHTML = '';
+  if (!rows.length) {
+    ui.wifiList.append(el('li', 'empty', 'No phone with Wireless debugging found on this network yet.'));
+    return;
+  }
+  for (const r of rows) {
+    const li = el('li');
+    const text = el('div', 'grow');
+    text.append(el('div', '', r.model), el('div', 'sub',
+      `${r.address} · ${r.dev ? (r.dev.state === 'device' ? 'connected' : r.dev.state) : 'not connected'}`));
+    const btn = el('button', '', r.dev ? 'Disconnect' : 'Connect');
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        if (r.dev) {
+          await invoke('wifi_op', { op: 'disconnect', args: [r.dev.serial] });
+          setWifiStatus(`Disconnected ${r.model}.`);
+        } else {
+          setWifiStatus(`Connecting to ${r.address}…`);
+          await invoke('wifi_op', { op: 'connect', args: [r.address] });
+          setWifiStatus(`Connected: ${r.model} over Wi-Fi.`, true);
+          await useDevice(r.address);
+        }
+      } catch (err) {
+        setWifiStatus(`${err}\nIf this phone was never paired with this Mac, scan the QR code first.`, false);
+      }
+      wifi.devices = await invoke('list_devices').catch(() => wifi.devices);
+      renderWifiList();
+    });
+    li.append(text, btn);
+    ui.wifiList.append(li);
+  }
+}
+async function pairWithCode() {
+  const address = ui.wifiAddr.value.trim();
+  const code = ui.wifiPin.value.trim();
+  if (!/^(\d{1,3}\.){3}\d{1,3}:\d+$|^\[[0-9a-fA-F:]+\]:\d+$/.test(address)) {
+    setWifiStatus('Enter the IP address and port shown on the phone, for example 192.168.1.23:37123.', false); return;
+  }
+  if (!/^\d{6}$/.test(code)) { setWifiStatus('Enter the 6-digit code shown on the phone.', false); return; }
+  if (wifi.pairing) return;
+  ui.wifiPair.disabled = true;
+  await pairAndConnect(address, code);
+  ui.wifiPair.disabled = false;
+  ui.wifiPin.value = '';
+}
+
 // --------------------------------------------------------------------- panes ---
 function makePane(side) {
   const root = $(`pane-${side}`);
@@ -287,7 +462,7 @@ async function loadPane(pane, path, { keepSelection = false } = {}) {
         'adbcp needs Google’s adb to reach the phone.\nPress Refresh to download it from Google, or install it yourself (for example with Homebrew: brew install android-platform-tools) and press Refresh.'
       : state.devices.length
         ? 'The phone is not ready.\nUnlock it and allow this computer when it asks, then press Refresh.'
-        : 'No phone found.\nConnect it with a USB cable, turn on USB debugging (Settings › Developer options), allow this computer when the phone asks, then press Refresh.';
+        : 'No phone found.\nConnect it with a USB cable, turn on USB debugging (Settings › Developer options), allow this computer when the phone asks, then press Refresh.\nOr press Wi-Fi… to connect over Wi-Fi (Wireless debugging).';
     pane.selected.clear();
     renderPane(pane);
     return;
@@ -986,6 +1161,11 @@ document.addEventListener('keydown', (ev) => {
     return;
   }
   if (!ui.settings.hidden) { if (ev.key === 'Escape') ui.settings.hidden = true; return; }
+  if (!ui.wifiSheet.hidden) {
+    if (ev.key === 'Escape') closeWifi();
+    else if (ev.key === 'Enter' && (ev.target === ui.wifiAddr || ev.target === ui.wifiPin)) pairWithCode();
+    return;
+  }
   if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT') return;
   const pane = panes[state.activeSide];
   if (ev.metaKey && ev.key === 'a') { ev.preventDefault(); pane.selected = new Set(pane.shown.map((e) => e.path)); renderSelection(pane); }
@@ -999,6 +1179,9 @@ document.addEventListener('keydown', (ev) => {
 });
 
 ui.refresh.addEventListener('click', async () => { await refreshDevices(); refreshTuning(true); });
+ui.wifi.addEventListener('click', openWifi);
+ui.wifiClose.addEventListener('click', closeWifi);
+ui.wifiPair.addEventListener('click', pairWithCode);
 ui.device.addEventListener('change', () => { updateControls(); loadPane(panes.phone, panes.phone.path); refreshTuning(true); });
 ui.openSettings.addEventListener('click', () => { ui.settings.hidden = false; refreshTuning(true); });
 ui.closeSettings.addEventListener('click', () => { ui.settings.hidden = true; });

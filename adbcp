@@ -69,6 +69,12 @@ usage: adbcp [options] SRC... DEST              computer -> phone
 options:
   --pull            copy from the phone to this computer
   --devices         list connected phones (with --json: one "device" event each)
+  --wifi-scan       list phones offering Wireless debugging on this network
+                    (with --json: one "wifi_service" event each, kind pairing or connect)
+  --wifi-pair ADDRESS CODE   pair with a phone (Developer options > Wireless debugging >
+                    Pair device with pairing code); ADDRESS is the IP:port it shows
+  --wifi-connect ADDRESS     connect to a paired phone over Wi-Fi (IP:port)
+  --wifi-disconnect SERIAL   end a Wi-Fi connection
   --ls PATH         list a folder on the phone (with --json: one "entry" event each)
   --show-profile PATH  show the saved measurements for this phone and destination PATH
   --measure PATH    measure this phone, connection and destination PATH now, without copying
@@ -795,6 +801,55 @@ list_devices() {
   done
 }
 
+# --wifi-scan: phones that offer Wireless debugging on this network, found by adb's own
+# mDNS discovery. "pairing" services appear while the phone's pairing screen is open
+# (QR code or pairing code); "connect" services while Wireless debugging is on.
+wifi_scan() {
+  local name type addr kind
+  resolve_adb
+  "$ADB" start-server >/dev/null 2>&1
+  "$ADB" mdns services 2>/dev/null | tr -d '\r' | sed 1d | while IFS=$'\t' read -r name type addr; do
+    case $type in
+      _adb-tls-pairing.*) kind=pairing ;;
+      _adb-tls-connect.*) kind=connect ;;
+      *) continue ;;
+    esac
+    if [ $OUT_JSON = 1 ]; then
+      emit wifi_service "$(js name "$name")" "$(js kind "$kind")" "$(js address "$addr")"
+    else
+      printf '%-8s %-22s %s\n' "$kind" "$addr" "$name"
+    fi
+  done
+}
+
+# --wifi-pair ADDRESS CODE, --wifi-connect ADDRESS, --wifi-disconnect SERIAL
+wifi_op() {
+  local op=$1 out ok; shift
+  case $op in
+    pair) [ $# -eq 2 ] || die "--wifi-pair takes the address (IP:port) and the pairing code" ;;
+    *) [ $# -eq 1 ] || die "--wifi-$op takes one address" ;;
+  esac
+  case $op:$1 in
+    disconnect:*) ;;
+    *:*[!0-9A-Fa-f.:\[\]]*|*:*[!0-9]) die "not an IP:port address: $1" ;;
+  esac
+  resolve_adb
+  "$ADB" start-server >/dev/null 2>&1
+  case $op in
+    pair)       out=$("$ADB" pair "$1" "$2" </dev/null 2>&1); ok="Successfully paired" ;;
+    connect)    out=$("$ADB" connect "$1" </dev/null 2>&1); ok="connected to" ;;   # also "already connected to"
+    disconnect) out=$("$ADB" disconnect "$1" </dev/null 2>&1); ok="disconnected" ;;
+  esac
+  out=$(printf '%s' "$out" | tr -d '\r')
+  case $out in
+    *"failed"*|*"Failed"*|*"error"*) die "$(printf '%s' "$out" | grep -i -m1 -E 'fail|error' | sed 's/^error: //')" ;;
+    *"$ok"*) ;;
+    *) die "${out:-adb $op gave no answer}" ;;
+  esac
+  emit op_done "$(js op "wifi_$op")" "$(jn count 1)"
+  [ $OUT_JSON = 1 ] || printf '%s\n' "$out"
+}
+
 # Reports the saved measurements (or the built-in defaults) for this phone, connection
 # and the kind of destination PATH is: a "profile" event with --json.
 report_profile() {
@@ -946,7 +1001,11 @@ connect() {
         "A USB 3 data cable and port can be 5-10x faster."
     fi
   fi
-  [ $TRANSPORT = tcp ] && SLOW_LINK=1
+  # Wi-Fi (Wireless debugging): each adb stream waits for the phone to confirm every
+  # packet, and Wi-Fi latency makes that slow, so parallel streams help more than on
+  # USB. 300 MiB to an S23 Ultra over Wi-Fi: 1 stream 9.9 MiB/s, 3 parts of 128 MiB
+  # 11.6 MiB/s, 10 parts of 32 MiB on 8 streams 14.7 MiB/s. So split, in smaller parts.
+  if [ $TRANSPORT = tcp ] && [ $CHUNK_SET = 0 ]; then CHUNK=$((32 * BS)); fi
   # zstd beat lz4 everywhere measured (USB 2.0: 3x vs 2.2x; USB 3, 8 streams of game
   # data: 386 vs 333 MiB/s) and costs only ~6% on incompressible data.
   if has_feat sendrecv_v2_zstd; then AUTO_ALGO=zstd
@@ -989,6 +1048,7 @@ bench() {
 # -------------------------------------------------------------------- main ---
 main() {
   J=8 COMP=auto CHUNK=$((128 * BS)) SPLIT_MIN=$((256 * BS)) NO_SPLIT=0 VERIFY=0
+  WIFI_SCAN=0 WIFI_OP="" CHUNK_SET=0
   ADB_STATUS=0 GET_ADB=0 PULL=0 LIST_DEVICES=0 LS_PATH="" SHOW_PROFILE="" MEASURE="" FIX_NAMES=0 PHONE_OP="" J_SET=0 RECAL=0 SPLIT_SET=0 SKIP_EXISTING=0 DRY=0 FORCE=0 BURST=0 LIBUSB=0 BENCH=0 BENCH_SIZE=$((1024 * BS))
   local args=() a
   while [ $# -gt 0 ]; do
@@ -999,7 +1059,7 @@ main() {
       -s) ANDROID_SERIAL=$2; export ANDROID_SERIAL; shift ;;
       -j) J=$2; J_SET=1; shift ;;
       -z) COMP=$2; shift ;;
-      --chunk) CHUNK=$(parse_size "$2") || die "bad size: $2"; shift ;;
+      --chunk) CHUNK=$(parse_size "$2") || die "bad size: $2"; CHUNK_SET=1; shift ;;
       --split-min) SPLIT_MIN=$(parse_size "$2") || die "bad size: $2"; SPLIT_SET=1; shift ;;
       --bench-size) BENCH_SIZE=$(parse_size "$2") || die "bad size: $2"; shift ;;
       --no-split) NO_SPLIT=1 ;;
@@ -1010,6 +1070,10 @@ main() {
       --recalibrate) RECAL=1 ;;
       --pull) PULL=1 ;;
       --devices) LIST_DEVICES=1 ;;
+      --wifi-scan) WIFI_SCAN=1 ;;
+      --wifi-pair) WIFI_OP=pair ;;
+      --wifi-connect) WIFI_OP=connect ;;
+      --wifi-disconnect) WIFI_OP=disconnect ;;
       --show-profile) SHOW_PROFILE=$2; shift ;;
       --measure) MEASURE=$2; shift ;;
       --fix-names) FIX_NAMES=1 ;;
@@ -1046,6 +1110,8 @@ main() {
   [ $ADB_STATUS = 1 ] && { adb_status; exit 0; }
   [ $GET_ADB = 1 ] && { ADB=""; fetch_adb "$(cache_dir)"; adb_status; exit 0; }
   [ $LIST_DEVICES = 1 ] && { list_devices; exit 0; }
+  [ $WIFI_SCAN = 1 ] && { wifi_scan; exit 0; }
+  [ -z "$WIFI_OP" ] || { wifi_op "$WIFI_OP" "$@"; exit 0; }
   [ -z "$LS_PATH" ] || { list_dir "$LS_PATH"; exit 0; }
   [ -z "$SHOW_PROFILE" ] || { show_profile "$SHOW_PROFILE"; exit 0; }
   [ -z "$MEASURE" ] || { measure_only "$MEASURE"; exit; }

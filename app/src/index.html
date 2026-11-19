@@ -12,6 +12,7 @@
     <label class="label" for="device">Phone</label>
     <select id="device"></select>
     <button id="refresh" title="Look for connected phones again">Refresh</button>
+    <button id="wifi" title="Connect a phone over Wi-Fi (Wireless debugging)">Wi-Fi…</button>
     <span id="device-note" class="note"></span>
     <span class="grow"></span>
     <button id="open-settings" title="Settings">⚙ Settings</button>
@@ -172,6 +173,38 @@
         <label class="choice"><input type="checkbox" id="force"> Skip the free-space check (not remembered)</label>
       </div>
     </div>
+  </div>
+</div>
+
+<div id="wifi-sheet" class="overlay" hidden>
+  <div class="sheet wifi-sheet" role="dialog" aria-modal="true" aria-labelledby="wifi-title">
+    <header>
+      <h2 id="wifi-title">Connect over Wi-Fi</h2>
+      <span class="grow"></span>
+      <button id="wifi-close" class="primary">Done</button>
+    </header>
+    <div class="wifi-body">
+      <div id="wifi-qr" class="qr" aria-label="QR code for pairing"></div>
+      <div class="stack grow">
+        <ol class="steps">
+          <li>Connect the phone and this Mac to the same Wi-Fi network.</li>
+          <li>On the phone, open <b>Settings › Developer options › Wireless debugging</b> and turn it on.</li>
+          <li>Tap <b>Pair device with QR code</b> and scan this code.</li>
+        </ol>
+        <p id="wifi-status" class="wifi-status"></p>
+      </div>
+    </div>
+    <details id="wifi-code">
+      <summary>Pair with a code instead</summary>
+      <p class="hint">On the phone, tap <b>Pair device with pairing code</b>. Enter the IP address and port, and the 6-digit code it shows.</p>
+      <div class="row">
+        <input id="wifi-addr" placeholder="IP address:port" spellcheck="false" autocomplete="off">
+        <input id="wifi-pin" placeholder="Code" inputmode="numeric" maxlength="6" size="8" spellcheck="false" autocomplete="off">
+        <button id="wifi-pair">Pair</button>
+      </div>
+    </details>
+    <h3>Phones on this network</h3>
+    <ul id="wifi-list" class="plain wifi-list"></ul>
   </div>
 </div>
 

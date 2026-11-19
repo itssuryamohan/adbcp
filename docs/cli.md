@@ -122,6 +122,27 @@ Copies from the phone use fixed values. They do not measure.
 | `-s SERIAL` | Use this phone. The default is `$ANDROID_SERIAL`, or the only connected phone. |
 | `--devices` | List the connected phones. |
 
+### Wi-Fi (Wireless debugging)
+
+| Option | What it does |
+|---|---|
+| `--wifi-scan` | List the phones on this network that have Wireless debugging on. |
+| `--wifi-pair ADDRESS CODE` | Pair with a phone. Use the IP address and port, and the 6-digit code, from **Pair device with pairing code** on the phone. |
+| `--wifi-connect ADDRESS` | Connect to a paired phone. Use the address from `--wifi-scan`. |
+| `--wifi-disconnect SERIAL` | End a Wi-Fi connection. |
+
+Example:
+
+```bash
+adbcp --wifi-scan                            # connect  192.168.1.23:41234  adb-R5CT…
+adbcp --wifi-pair 192.168.1.23:37123 123456  # one time for each phone
+adbcp --wifi-connect 192.168.1.23:41234
+adbcp -s 192.168.1.23:41234 ~/Movies/trip.mp4 /sdcard/Movies/
+```
+
+Over Wi-Fi, adbcp splits files of 256 MiB or more into 32 MiB parts and sends them on
+parallel streams. This made Wi-Fi copies about twice as fast in tests.
+
 ### Checks and safety
 
 | Option | What it does |

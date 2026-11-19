@@ -190,6 +190,20 @@ is the first engine version, which sent one file for each request.
 On a USB 2.0 cable, the same phone reached about 34 MB/s without compression. With data
 that compresses well, the effective speed reached about 108 MB/s.
 
+Over Wi-Fi (Wireless debugging), 300 MiB of video to the same phone:
+
+| Plan | Speed |
+|---|---|
+| 1 stream (the old rule: no splitting on a network link) | 9.9 MiB/s |
+| 3 parts of 128 MiB | 11.6 MiB/s |
+| 10 parts of 32 MiB on 8 streams (the rule now) | 14.7 MiB/s |
+
+Each adb stream waits for the phone to confirm every packet. Wi-Fi latency makes this
+wait long, so parallel streams help more than on USB. On a network link, the engine
+thus splits files as on USB 3, in 32 MiB parts, unless `--chunk` sets the part size.
+A copy that stops on Wi-Fi and continues over USB starts its split files again, because
+the part size is different.
+
 ## 7. How the app talks to the engine
 
 The app starts the engine as a separate program.
@@ -223,7 +237,8 @@ during the copy.
 | `error` | The copy cannot continue. The engine also sends it on cancel, with the message `interrupted`. | `message` |
 | `device` | One for each phone, from `adbcp --devices --json` | `serial`, `state` (`device` when ready, or `unauthorized`, `offline`, …), `model`, `connection`, `link_mbps` |
 | `entry` | One for each file or folder, from `adbcp --ls PATH --json` | `name`, `path`, `type` (`dir`, `file`, or `other`), `size`, `mtime` |
-| `op_done` | `--mkdir`, `--rename`, or `--delete` was successful | `op`, `count` (number of paths given) |
+| `op_done` | `--mkdir`, `--rename`, `--delete`, or a `--wifi-` command was successful | `op` (`mkdir`, `rename`, `delete`, `wifi_pair`, `wifi_connect`, `wifi_disconnect`), `count` |
+| `wifi_service` | One for each service, from `adbcp --wifi-scan --json` | `name`, `kind` (`pairing` or `connect`), `address` (`IP:port`) |
 | `adb` | From `--adb-status`, and after `--get-adb` | `found`, `path`, `source` (`environment`, `bundled`, `path`, `homebrew`, `android-sdk`, or `downloaded`), `version` |
 | `profile` | From `--show-profile PATH`, and after `--measure PATH` | `saved` (false: built-in values apply), `kind` (`media`, `appdir`, or `data`), `date`, `connection`, `link_mbps`, `streams`, `small_streams`, `small_kib`, `hash_workers`, `cores`, `large_mib_per_second`, `small_files_per_second` |
 
@@ -254,6 +269,10 @@ partial file and no process remained.
 | Command | What it does |
 |---|---|
 | `adbcp --devices` | Lists the connected phones with model and connection speed. |
+| `adbcp --wifi-scan` | Lists phones that offer Wireless debugging on the network, from adb's mDNS discovery: `pairing` services while a pairing screen is open, `connect` services while Wireless debugging is on. |
+| `adbcp --wifi-pair ADDRESS CODE` | Pairs with a phone (`adb pair`). ADDRESS is `IP:port`. The engine refuses other address formats. |
+| `adbcp --wifi-connect ADDRESS` | Connects to a paired phone (`adb connect`). |
+| `adbcp --wifi-disconnect SERIAL` | Ends a Wi-Fi connection (`adb disconnect`). |
 | `adbcp -s SERIAL --ls PATH` | Lists one folder on the phone, for the app's phone pane. |
 | `adbcp -s SERIAL --show-profile PATH` | Shows the saved measurement for the phone, its connection, and the kind of destination PATH. |
 | `adbcp -s SERIAL --measure PATH` | Measures now, without a copy, and saves the result. |
@@ -271,7 +290,7 @@ partial file and no process remained.
 ## 8. Requirements
 
 - **Computer:** a Mac with a current version of macOS. The engine uses only tools that come with macOS, plus adb.
-- **Phone:** Android with *USB debugging* on. The user must allow this computer when the phone asks. Compression needs Android 11 or later.
+- **Phone:** Android with *USB debugging* on, or Wireless debugging (Android 11 or later). The user must allow this computer when the phone asks. Compression needs Android 11 or later.
 - **Cable:** any USB data cable works. A USB 3 cable and port are much faster.
 
 ## 9. Packaging and distribution

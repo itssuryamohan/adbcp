@@ -70,6 +70,7 @@ The app shows two file lists side by side: this Mac on the left, the phone on th
 - Drop files from Finder onto the phone pane.
 - Make folders, rename, and delete on both sides.
 - See the progress, speed, time left, and problems in the transfer bar.
+- Connect the phone over Wi-Fi with a QR code (Wireless debugging), without a cable.
 
 Download the app from the **Releases** page. It runs on Apple Silicon and Intel Macs.
 Apple did not notarize it, so you must allow it one time. See

@@ -19,6 +19,17 @@ In the app, open **Details** in the transfer bar to read all engine messages.
 | "more than one device/emulator" | Select the phone with `-s SERIAL`. `./adbcp --devices` shows the serial numbers. |
 | "no devices/emulators found" | Check that USB debugging is on. See [Install](install.md#turn-on-usb-debugging). |
 
+## Wi-Fi problems
+
+| Problem | What to do |
+|---|---|
+| The app does not find the phone | Put the phone and the Mac on the same Wi-Fi network. Some public and guest networks block devices from seeing each other. |
+| macOS asked about the local network and you clicked **Don't Allow** | Open **System Settings > Privacy & Security > Local Network** and turn on adbcp. |
+| Pairing fails | Pairing codes work one time and expire. Open the pairing screen on the phone again and scan the new code. |
+| **Connect** fails: "failed to connect" | The phone was not paired with this Mac, or Wireless debugging turned off. Pair again with the QR code. |
+| The phone disappears after some time | Android turns off Wireless debugging when the phone leaves the network. Turn it on again, then click **Connect** in **Wi-Fi…**. |
+| Wi-Fi copies are slow | Your Wi-Fi network sets the speed. Use 5 GHz or 6 GHz Wi-Fi near the router, or use the USB cable for large copies. |
+
 ## adb problems
 
 | Message | What to do |

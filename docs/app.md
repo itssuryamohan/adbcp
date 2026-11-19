@@ -16,6 +16,29 @@ The app uses the same engine as the command-line tool. For the full design, see 
 If the phone does not show, click **Refresh**. If the phone pane shows a message, follow
 its steps.
 
+## Connect over Wi-Fi
+
+You can use the phone without a cable. The phone and the Mac must be on the same Wi-Fi
+network.
+
+1. Click **Wi-Fi…** next to **Refresh**. The app shows a QR code.
+2. On the phone, open **Settings > Developer options > Wireless debugging** and turn it on.
+3. Tap **Pair device with QR code** and scan the code on the Mac.
+
+The app pairs, connects, and selects the phone. The **Phone** list shows it as
+"SM-S918B · Wi-Fi". You pair each phone one time. Later, open **Wi-Fi…** and click
+**Connect** next to the phone.
+
+If the phone cannot scan the code, open **Pair with a code instead**. On the phone, tap
+**Pair device with pairing code**. Type the IP address and port, and the 6-digit code,
+then click **Pair**. The app fills in the address when it finds the phone.
+
+Wi-Fi is slower than USB. Your Wi-Fi network sets the speed. On the test network, copies
+ran at about 16 MiB/s, against about 400 MiB/s over USB 3.
+
+macOS can ask to let adbcp find devices on the local network. Click **Allow**. Without
+it, the app cannot find the phone.
+
 ## Move around
 
 - Double-click a folder to open it.

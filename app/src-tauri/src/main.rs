@@ -101,6 +101,42 @@ async fn list_devices(app: AppHandle) -> Result<Vec<Value>, String> {
     blocking(move || query(&app, vec!["--devices".into()])).await?
 }
 
+/// Phones offering Wireless debugging on this network (adb's mDNS discovery).
+#[tauri::command]
+async fn wifi_scan(app: AppHandle) -> Result<Vec<Value>, String> {
+    blocking(move || query(&app, vec!["--wifi-scan".into()])).await?
+}
+
+/// Pairs with, connects to, or disconnects from a phone over Wi-Fi.
+#[tauri::command]
+async fn wifi_op(app: AppHandle, op: String, args: Vec<String>) -> Result<(), String> {
+    let flag = match op.as_str() {
+        "pair" => "--wifi-pair",
+        "connect" => "--wifi-connect",
+        "disconnect" => "--wifi-disconnect",
+        _ => return Err(format!("unknown Wi-Fi operation {op}")),
+    };
+    blocking(move || {
+        let mut a = vec![flag.to_string(), "--".to_string()];
+        a.extend(args);
+        query(&app, a).map(|_| ())
+    })
+    .await?
+}
+
+/// The QR code for "Pair device with QR code", as an SVG image.
+#[tauri::command]
+fn qr_svg(text: String) -> Result<String, String> {
+    use qrcode::render::svg;
+    let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(code
+        .render::<svg::Color>()
+        .min_dimensions(200, 200)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build())
+}
+
 #[tauri::command]
 async fn list_dir(app: AppHandle, serial: String, path: String) -> Result<Vec<Value>, String> {
     blocking(move || query(&app, vec!["-s".into(), serial, "--ls".into(), path])).await?
@@ -439,6 +475,9 @@ fn main() {
             get_adb,
             open_adb_terms,
             list_devices,
+            wifi_scan,
+            wifi_op,
+            qr_svg,
             list_dir,
             list_local,
             local_places,
