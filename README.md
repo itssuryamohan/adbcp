@@ -27,14 +27,14 @@ each piece. adbcp uses the same adb, but it:
 
 | Phone | Direction | adbcp | Plain `adb` | Faster by |
 |---|---|---|---|---|
-| Galaxy S23 Ultra (Snapdragon 8 Gen 2, Android 17) | Mac to phone | 32 s (about 400 MiB/s) | not measured | — |
-| | Phone to Mac | 32 s | 68–76 s | about 2.2× |
+| Galaxy S23 Ultra (Snapdragon 8 Gen 2, Android 17) | Mac to phone | 32–37 s (350–400 MiB/s) | 70 s (185 MiB/s) | about 2× |
+| | Phone to Mac | 32–34 s (about 380 MiB/s) | 68–76 s | about 2.2× |
 | Galaxy S21 Ultra (Exynos 2100, Android 15) | Mac to phone | 61–65 s (200–213 MiB/s) | 160 s (80 MiB/s) | about 2.5× |
 | | Phone to Mac | 48 s (267 MiB/s) | 104 s (124 MiB/s) | about 2.2× |
 
-The adbcp times do not include the first-time measurement of each phone (about 10
-seconds). Over a USB 2.0 cable, the S23 Ultra reached about 34 MB/s. Your phone, cable,
-and Mac can give different results.
+Ranges come from runs on different days. The adbcp times do not include the first-time
+measurement of each phone (about 10 seconds). Over a USB 2.0 cable, the S23 Ultra
+reached about 34 MB/s. Your phone, cable, and Mac can give different results.
 
 ## Quick start
 

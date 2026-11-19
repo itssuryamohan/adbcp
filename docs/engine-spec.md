@@ -188,6 +188,10 @@ is the first engine version, which sent one file for each request.
 | Verify 12.6 GB | about 40 s | 23–29 s |
 | Copy 12.6 GB, 1,881 files **from** the phone | 68–76 s (standard `adb pull`) | 32 s |
 
+A rerun on 2026-11-19, with the phone's storage 64% full: plain `adb push` of the 12.6 GB
+folder took 70 s (185 MiB/s). adbcp took 36–37 s (349–354 MiB/s) to the phone and 34 s
+(377.5 MiB/s) from the phone.
+
 On a USB 2.0 cable, the same phone reached about 34 MB/s without compression. With data
 that compresses well, the effective speed reached about 108 MB/s.
 
