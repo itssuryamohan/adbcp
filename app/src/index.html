@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>adbcp</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main>
+  <section class="row">
+    <label class="label" for="device">Phone</label>
+    <select id="device" class="grow"></select>
+    <button id="refresh" title="Look for connected phones again">Refresh</button>
+  </section>
+  <p id="device-note" class="note" hidden></p>
+
+  <section class="row">
+    <span class="label">Direction</span>
+    <label class="choice"><input type="radio" name="direction" value="push" checked> Computer to phone</label>
+    <label class="choice"><input type="radio" name="direction" value="pull"> Phone to computer</label>
+  </section>
+
+  <section class="sources">
+    <div class="row">
+      <span class="label">Copy</span>
+      <span class="grow"></span>
+      <button id="add-files">Add files…</button>
+      <button id="add-folder">Add folder…</button>
+      <button id="add-phone" hidden>Add from phone…</button>
+      <button id="remove" disabled>Remove</button>
+    </div>
+    <div class="drop-area">
+      <ul id="sources" class="list"></ul>
+      <div id="drop-hint" hidden></div>
+    </div>
+  </section>
+
+  <section class="row">
+    <label class="label" for="dest">To</label>
+    <input id="dest" class="grow" spellcheck="false" autocomplete="off">
+    <button id="browse">Browse…</button>
+  </section>
+
+  <section class="row">
+    <span class="label"></span>
+    <label class="choice"><input type="checkbox" id="verify" checked> Verify after copying</label>
+    <label class="choice"><input type="checkbox" id="skip"> Skip files already there</label>
+  </section>
+
+  <section class="row">
+    <span class="label">Tuning</span>
+    <span id="tuning" class="grow small"></span>
+    <button id="measure" title="Measure this phone, cable and destination now (about 10 seconds)">Measure now</button>
+  </section>
+
+  <details id="advanced">
+    <summary>Advanced settings</summary>
+    <div class="grid">
+      <label for="streams">Parallel transfers</label>
+      <select id="streams">
+        <option value="">Automatic</option>
+        <option>1</option><option>2</option><option>4</option><option>8</option><option>12</option><option>16</option>
+      </select>
+      <label for="compression">Compression</label>
+      <select id="compression">
+        <option value="auto">Automatic</option>
+        <option value="none">Off</option>
+        <option value="zstd">zstd</option>
+        <option value="lz4">lz4</option>
+      </select>
+      <label for="split">Split very large files</label>
+      <select id="split">
+        <option value="1">Automatic</option>
+        <option value="0">Off</option>
+      </select>
+      <label for="part-size">Part size</label>
+      <select id="part-size">
+        <option value="32">32 MiB</option><option value="64">64 MiB</option>
+        <option value="128" selected>128 MiB (default)</option>
+        <option value="256">256 MiB</option><option value="512">512 MiB</option>
+      </select>
+      <label for="split-min">Split files from</label>
+      <select id="split-min">
+        <option value="64">64 MiB</option><option value="128">128 MiB</option>
+        <option value="256" selected>256 MiB (default)</option>
+        <option value="512">512 MiB</option><option value="1024">1 GiB</option>
+      </select>
+      <span>Names</span>
+      <label class="choice"><input type="checkbox" id="fix-names"> Replace characters the phone does not allow (" * : &lt; &gt; ? | \) with _</label>
+      <span>Experimental</span>
+      <div class="stack">
+        <label class="choice"><input type="checkbox" id="burst"> Burst mode</label>
+        <label class="choice"><input type="checkbox" id="libusb"> libusb connection</label>
+        <span class="hint">Both restart adb, which briefly disconnects other adb tools. Burst mode was slower on real copies in testing.</span>
+      </div>
+      <span>Safety</span>
+      <label class="choice"><input type="checkbox" id="force"> Skip the free-space check</label>
+    </div>
+  </details>
+
+  <section id="status">
+    <div id="summary"></div>
+    <div class="progress"><div id="bar"></div></div>
+    <div id="stats">Ready.</div>
+    <div id="result"></div>
+  </section>
+
+  <details id="problems" hidden>
+    <summary id="problems-title">Problems</summary>
+    <ul id="problem-list" class="list small"></ul>
+  </details>
+  <details id="details">
+    <summary>Details</summary>
+    <pre id="log"></pre>
+  </details>
+
+  <footer>
+    <button id="retry" hidden>Retry failed files</button>
+    <button id="safe-names" hidden>Copy with safe names</button>
+    <span class="grow"></span>
+    <button id="cancel" disabled>Cancel</button>
+    <button id="start" class="primary">Start</button>
+  </footer>
+</main>
+
+<div id="browser" class="overlay" hidden>
+  <div class="sheet">
+    <header>
+      <button id="up" title="Up one folder">↑</button>
+      <span id="here" class="grow"></span>
+    </header>
+    <ul id="entries" class="list"></ul>
+    <footer>
+      <label class="choice small"><input type="checkbox" id="hidden-files"> Show hidden</label>
+      <span class="grow"></span>
+      <button id="browser-cancel">Cancel</button>
+      <button id="choose" class="primary">Choose this folder</button>
+    </footer>
+  </div>
+</div>
+
+<script src="main.js"></script>
+</body>
+</html>

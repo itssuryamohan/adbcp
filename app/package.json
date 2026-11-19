@@ -1,0 +1,14 @@
+{
+  "name": "adbcp-app",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Desktop app for the adbcp copy engine",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build --bundles app"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

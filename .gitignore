@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+._*
+
+# Google's adb, placed here by `./adbcp --bundle`. Google's license limits redistributing
+# it, so it is not committed; adbcp downloads it from Google on first use instead.
+/platform-tools/
+
+# Desktop app: dependencies and build output (rebuilt with `npm install` / `npm run build`)
+/app/node_modules/
+/app/src-tauri/target/
+/app/src-tauri/gen/
+
+# Editors
+.vscode/
+.idea/
+*.swp

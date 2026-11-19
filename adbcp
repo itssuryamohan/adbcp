@@ -62,6 +62,12 @@ usage: adbcp [options] SRC... DEST              computer -> phone
 
 options:
   --pull            copy from the phone to this computer
+  --devices         list connected phones (with --json: one "device" event each)
+  --ls PATH         list a folder on the phone (with --json: one "entry" event each)
+  --show-profile PATH  show the saved measurements for this phone and destination PATH
+  --measure PATH    measure this phone, connection and destination PATH now, without copying
+  --fix-names       copy files whose names the phone does not allow (" * : < > ? | \)
+                    with those characters replaced by _
   -s SERIAL         device to use (default: \$ANDROID_SERIAL or the only device)
   -j N              parallel streams for big files (default: 8); small files get
                     2 more, or -j more when there is little big data to overlap with
@@ -200,7 +206,8 @@ $1
 # Reports through files in $ADBCP_TMP that the progress monitor reads:
 #   done     "BYTES FILES [PARTS]" per finished job (a chunk is 1/PARTS of a file)
 #   run/PID  "BYTES<TAB>REMOTE" while a large push runs, so its progress can be polled
-#   errors   "REMOTE<TAB>MESSAGE" per failed job;  failed: every remote path that failed
+#   errors   "REMOTE<TAB>REASON<TAB>MESSAGE" per failure (REASON: copy_failed,
+#            assemble_failed, name_not_allowed);  failed: every remote path that failed
 job() {
   local bytes=$1 kind=$2 algo=$3 src=$4 dst=$5 skip=$6 count=$7
   local t0 t1 try err="" rcmd label zf f files=() run="" btmp="" out got
@@ -252,7 +259,7 @@ job() {
       fi
       err=$(printf '%s' "$err" | tr '\n\t' '  ' | sed "s/^adb: error: //; s/^failed to copy '.*' to '.*': //; s/  */ /g")
       printf '%sadbcp: error: failed to copy %s: %s\n' "$ADBCP_CLR" "$dst" "${err:-unknown error}" >&2
-      printf '%s\t%s\n' "$dst" "${err:-unknown error}" >> "$ADBCP_TMP/errors"
+      printf '%s\tcopy_failed\t%s\n' "$dst" "${err:-unknown error}" >> "$ADBCP_TMP/errors"
       if [ "$kind" = batch ]; then
         for f in "${files[@]}"; do printf '%s/%s\n' "$dst" "${f##*/}"; done
       else
@@ -284,7 +291,7 @@ job() {
 # of each file on the phone, so the bar also moves inside big files. Draws a progress
 # bar for people, or emits "progress" events with --json.
 monitor() {
-  local tick=0 last=0 shown=0 inflight=0 rate=0 pp=0 pt=$ADBCP_T0 t p db df nf line next_log=10 el
+  local tick=0 last=0 shown=0 inflight=0 rate=0 pp=0 pt=$ADBCP_T0 t p db df nf line rest next_log=10 el
   local nerr; nerr=$(wc -l < "$T/errors" | tr -d ' ')   # reported before the copy started
   while :; do
     [ -f "$T/stop" ] && last=1
@@ -319,7 +326,8 @@ monitor() {
       while [ "$(wc -l < "$T/errors" | tr -d ' ')" -gt $nerr ]; do
         nerr=$((nerr + 1))
         line=$(sed -n "${nerr}p" "$T/errors")
-        emit file_failed "$(js path "${line%%$TAB*}")" "$(js error "${line#*$TAB}")"
+        rest=${line#*$TAB}
+        emit file_failed "$(js path "${line%%$TAB*}")" "$(js reason "${rest%%$TAB*}")" "$(js error "${rest#*$TAB}")"
       done
       if [ $((tick % 2)) = 0 ] || [ $last = 1 ]; then
         emit progress "$(jn bytes_done "$p")" "$(jn bytes_total "$ADBCP_TOTAL")" "$(jn files_done "$df")" \
@@ -437,6 +445,7 @@ restart_server() {
 #   P_SMALL_J    streams for small files when there is little big data to overlap with
 #   P_HASH_P     parallel hashers on the device for --verify
 P_J=8 P_SMALL_KIB=3584 P_SMALL_J=8 P_HASH_P=4 P_DATE="" P_INFO="" TUNING="built-in defaults" COMP_TEST=""
+P_BIG="" P_SMALL="" P_CORES=""   # raw measurements: "2:158 4:218 8:294" (MiB/s, files/s by streams)
 PROBE="" PROBE_RM="" PROBE_RM_PID=""
 CAL_MIN_BYTES=$((2048 * BS)) CAL_MIN_FILES=1000
 PROBE_FILE_MIB=4 PROBE_FILES_PER_STREAM=4 PROBE_FILES=40
@@ -467,8 +476,16 @@ load_profile() {
         eval "$k=\$v" ;;            # k is one of the four literal names above
       P_DATE) P_DATE=$v ;;
       P_INFO) P_INFO=$v ;;
+      P_BIG|P_SMALL) case $v in *[!0-9:\ ]*) ;; *) eval "$k=\$v" ;; esac ;;   # digits, colons, spaces only
+      P_CORES) case $v in ''|*[!0-9]*) ;; *) P_CORES=$v ;; esac ;;
     esac
   done < "$PROFILE"
+  # Profiles saved before the raw fields existed: take them from the summary text.
+  if [ -z "$P_BIG" ] && [ -n "$P_INFO" ]; then
+    P_BIG=$(printf '%s' "$P_INFO" | sed -n 's/.*big MiB\/s by streams \([0-9: ]*\);.*/\1/p')
+    P_SMALL=$(printf '%s' "$P_INFO" | sed -n 's/.*small files\/s by streams \([0-9: ]*\);.*/\1/p')
+    P_CORES=$(printf '%s' "$P_INFO" | sed -n 's/.*cores \([0-9]*\).*/\1/p')
+  fi
   TUNING="saved measurements from $P_DATE"
 }
 
@@ -553,7 +570,7 @@ calibrate() {
     small="$small $n:$(awk -v n=$n -v f=$PROBE_FILES -v t="$t" 'BEGIN { printf "%.0f", (t > 0 ? n * f / t : 0) }')"
   done
   big=${big# } small=${small# }
-  cores=$("$ADB" shell nproc </dev/null 2>/dev/null | tr -dc '0-9')
+  cores=$("$ADB" shell "nproc --all 2>/dev/null || nproc" </dev/null 2>/dev/null | tr -dc '0-9')
   # Sanity: every probe must have moved data, else keep the defaults.
   case " $big $small " in *:0\ *|*:\ *) warn "measuring failed ($big | $small); using built-in defaults"; return 1 ;; esac
   P_J=$(most_n 0.95 "$big")
@@ -563,9 +580,10 @@ calibrate() {
   P_HASH_P=$(( ${cores:-8} / 2 )); [ $P_HASH_P -ge 2 ] || P_HASH_P=2; [ $P_HASH_P -le 8 ] || P_HASH_P=8
   P_DATE=$(date +%Y-%m-%d)
   P_INFO="big MiB/s by streams $big; small files/s by streams $small; cores ${cores:-?}"
+  P_BIG=$big P_SMALL=$small P_CORES=$cores
   mkdir -p "${PROFILE%/*}" &&
-    printf 'P_J=%s\nP_SMALL_KIB=%s\nP_SMALL_J=%s\nP_HASH_P=%s\nP_DATE=%s\nP_INFO=%s\n' \
-      "$P_J" "$P_SMALL_KIB" "$P_SMALL_J" "$P_HASH_P" "$P_DATE" "$P_INFO" > "$PROFILE"
+    printf 'P_J=%s\nP_SMALL_KIB=%s\nP_SMALL_J=%s\nP_HASH_P=%s\nP_DATE=%s\nP_BIG=%s\nP_SMALL=%s\nP_CORES=%s\nP_INFO=%s\n' \
+      "$P_J" "$P_SMALL_KIB" "$P_SMALL_J" "$P_HASH_P" "$P_DATE" "$P_BIG" "$P_SMALL" "$P_CORES" "$P_INFO" > "$PROFILE"
   TUNING="measured now"
   say "" "large files: $(printf '%s' "$big" | sed 's/[0-9]*://g; s/ /, /g') MiB/s on 2, 4, 8 streams -> $P_J streams"
   say "" "small files: $(printf '%s' "$small" | sed 's/[0-9]*://g; s/ /, /g') files/s on 2, 4, 8 streams -> up to $P_SMALL_J streams"
@@ -665,6 +683,110 @@ resolve_adb() {
   ADB=$(cache_dir)/platform-tools/adb
 }
 
+# USB link speed in bits per second for a device serial (macOS only; empty if unknown).
+usb_link_speed() {
+  command -v ioreg >/dev/null 2>&1 || return 0
+  ioreg -p IOUSB -l -w0 2>/dev/null | awk -v s="$1" '
+    function flush() { if (ser == s && spd != "") { print spd; found = 1; exit } ser = ""; spd = "" }
+    /\+-o / { flush() }
+    /"USB Serial Number" = / { v = $0; sub(/.*= "/, "", v); sub(/".*/, "", v); ser = v }
+    /"UsbLinkSpeed" = / { v = $0; sub(/.*= /, "", v); spd = v + 0 }
+    END { if (!found) flush() }'
+}
+
+# --devices: every phone adb can see, with its model and connection.
+list_devices() {
+  local serial state rest model conn link
+  resolve_adb
+  "$ADB" start-server >/dev/null 2>&1
+  "$ADB" devices -l 2>/dev/null | tr -d '\r' | sed 1d | while read -r serial state rest; do
+    [ -n "$serial" ] || continue
+    model=""
+    [ "$state" = device ] && model=$("$ADB" -s "$serial" shell getprop ro.product.model </dev/null 2>/dev/null | tr -d '\r')
+    [ -n "$model" ] || model=$(printf '%s' "$rest" | sed -n 's/.*model:\([^ ]*\).*/\1/p' | tr _ ' ')
+    case $serial in
+      *:*|*._tcp*|*adb-tls*) conn=network link="" ;;
+      *) conn=usb link=$(usb_link_speed "$serial") ;;
+    esac
+    if [ $OUT_JSON = 1 ]; then
+      emit device "$(js serial "$serial")" "$(js state "$state")" "$(js model "$model")" \
+        "$(js connection "$conn")" "$(jn link_mbps "${link:+$((link / 1000000))}")"
+    else
+      printf '%-22s %-14s %-18s %s\n' "$serial" "$state" "${model:--}" "$conn${link:+, $((link / 1000000)) Mb/s}"
+    fi
+  done
+}
+
+# Reports the saved measurements (or the built-in defaults) for this phone, connection
+# and the kind of destination PATH is: a "profile" event with --json.
+report_profile() {
+  local saved=$1 kind=$2
+  if [ $OUT_JSON = 1 ]; then
+    emit profile "$(jn saved "$saved")" "$(js kind "$kind")" "$(js date "$P_DATE")" \
+      "$(js connection "$([ $TRANSPORT = tcp ] && echo network || echo usb)")" \
+      "$(jn link_mbps "$([ -n "$LINK" ] && echo $((LINK / 1000000)))")" \
+      "$(jn streams "$P_J")" "$(jn small_streams "$P_SMALL_J")" "$(jn small_kib "$P_SMALL_KIB")" \
+      "$(jn hash_workers "$P_HASH_P")" "$(jn cores "$P_CORES")" \
+      "$(jpairs large_mib_per_second "$P_BIG")" "$(jpairs small_files_per_second "$P_SMALL")"
+  elif [ "$saved" = true ]; then
+    printf 'Measured %s for this phone, connection and %s destination:\n' "$P_DATE" "$kind"
+    printf '  large files: %s parallel transfers (%s MiB/s on 2, 4, 8)\n' "$P_J" "$(printf '%s' "$P_BIG" | sed 's/[0-9]*://g; s/ /, /g')"
+    printf '  small files: up to %s transfers (%s files/s on 2, 4, 8)\n' "$P_SMALL_J" "$(printf '%s' "$P_SMALL" | sed 's/[0-9]*://g; s/ /, /g')"
+    printf '  checksum workers for --verify: %s\n' "$P_HASH_P"
+  else
+    printf 'Not measured yet for this phone, connection and %s destination; built-in defaults apply\n' "$kind"
+    printf '(%s parallel transfers). Measured automatically before the first large copy, or with --measure.\n' "$P_J"
+  fi
+}
+
+show_profile() {
+  case $1 in /*) ;; *) die "phone paths must be absolute, e.g. /sdcard/Download/" ;; esac
+  connect
+  PROFILE=$(profile_path "$1")
+  if load_profile; then report_profile true "$(dest_kind "$1")"; else report_profile false "$(dest_kind "$1")"; fi
+}
+
+# --measure PATH: measure now (without copying) and save the results.
+measure_only() {
+  case $1 in /*) ;; *) die "phone paths must be absolute, e.g. /sdcard/Download/" ;; esac
+  connect
+  ADBCP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/adbcp.XXXXXX") || die "mktemp failed"
+  T=$ADBCP_TMP
+  trap 'rc=$?; probe_dir_remove; rm -rf "$T"; exit $rc' EXIT
+  trap 'exit 130' INT TERM
+  "$ADB" shell "mkdir -p $(rq "$1")" </dev/null >/dev/null 2>&1
+  PROFILE=$(profile_path "$1")
+  calibrate "$1" || exit 1
+  probe_dir_remove_bg   # the probe's files are deleted on the phone after we return
+  PROBE_RM=""
+  report_profile true "$(dest_kind "$1")"
+}
+
+# --ls PATH: the folders and files directly inside PATH on the phone.
+list_dir() {
+  local q err
+  resolve_adb
+  q=$(rq "$1"); err=$(mktemp "${TMPDIR:-/tmp}/adbcp-ls.XXXXXX")
+  "$ADB" shell "[ -d $q ] || { echo 'not a folder on the phone: '$q >&2; exit 2; }
+    find -H $q -mindepth 1 -maxdepth 1 -exec stat -L -c '%F$TAB%s$TAB%Y$TAB%n' {} + 2>/dev/null" </dev/null 2>"$err" |
+    tr -d '\r' | awk -F'\t' -v json=$OUT_JSON '
+      function esc(s,  o, i, c) { o = ""
+        for (i = 1; i <= length(s); i++) { c = substr(s, i, 1)
+          if (c == "\\") o = o "\\\\"; else if (c == "\"") o = o "\\\""; else o = o c }
+        return o }
+      NF >= 4 && $2 ~ /^[0-9]+$/ {
+        path = $4; for (i = 5; i <= NF; i++) path = path "\t" $i
+        name = path; sub(/.*\//, "", name)
+        type = ($1 == "directory") ? "dir" : ($1 ~ /file/) ? "file" : "other"
+        if (json) printf "{\"event\":\"entry\",\"name\":\"%s\",\"path\":\"%s\",\"type\":\"%s\",\"size\":%s,\"mtime\":%s}\n",
+          esc(name), esc(path), type, $2, $3
+        else printf "%-5s %14s  %s\n", type, $2, name }'
+  if [ -s "$err" ]; then
+    local m; m=$(head -1 "$err" | sed 's/^adb: //; s/^error: //'); rm -f "$err"; die "$m"
+  fi
+  rm -f "$err"
+}
+
 connect() {
   local state
   resolve_adb
@@ -684,13 +806,8 @@ connect() {
   FEATURES=$("$ADB" features 2>/dev/null | tr ',' '\n' | tr -d '\r')
   case $ANDROID_SERIAL in *:*|*._tcp*|*adb-tls*) TRANSPORT=tcp ;; *) TRANSPORT=usb ;; esac
   LINK="" SLOW_LINK=0
-  if [ $TRANSPORT = usb ] && command -v ioreg >/dev/null 2>&1; then
-    LINK=$(ioreg -p IOUSB -l -w0 2>/dev/null | awk -v s="$ANDROID_SERIAL" '
-      function flush() { if (ser == s && spd != "") { print spd; found = 1; exit } ser = ""; spd = "" }
-      /\+-o / { flush() }
-      /"USB Serial Number" = / { v = $0; sub(/.*= "/, "", v); sub(/".*/, "", v); ser = v }
-      /"UsbLinkSpeed" = / { v = $0; sub(/.*= /, "", v); spd = v + 0 }
-      END { if (!found) flush() }')
+  if [ $TRANSPORT = usb ]; then
+    LINK=$(usb_link_speed "$ANDROID_SERIAL")
     if [ -n "$LINK" ] && [ "$LINK" -lt 5000000000 ]; then
       SLOW_LINK=1
       [ -n "$QUIET" ] || warn "the phone is connected at USB 2.0 speed ($((LINK / 1000000)) Mb/s), about 40 MB/s at best." \
@@ -740,10 +857,10 @@ bench() {
 # -------------------------------------------------------------------- main ---
 main() {
   J=8 COMP=auto CHUNK=$((128 * BS)) SPLIT_MIN=$((256 * BS)) NO_SPLIT=0 VERIFY=0
-  PULL=0 J_SET=0 RECAL=0 SPLIT_SET=0 SKIP_EXISTING=0 DRY=0 FORCE=0 BURST=0 LIBUSB=0 BENCH=0 BENCH_SIZE=$((1024 * BS))
+  PULL=0 LIST_DEVICES=0 LS_PATH="" SHOW_PROFILE="" MEASURE="" FIX_NAMES=0 J_SET=0 RECAL=0 SPLIT_SET=0 SKIP_EXISTING=0 DRY=0 FORCE=0 BURST=0 LIBUSB=0 BENCH=0 BENCH_SIZE=$((1024 * BS))
   local args=() a
   while [ $# -gt 0 ]; do
-    case $1 in -s|-j|-z|--chunk|--split-min|--bench-size)
+    case $1 in -s|-j|-z|--chunk|--split-min|--bench-size|--ls|--show-profile|--measure)
       [ $# -ge 2 ] || die "option $1 needs a value" ;;
     esac
     case $1 in
@@ -760,6 +877,11 @@ main() {
       --burst) BURST=1 ;;
       --recalibrate) RECAL=1 ;;
       --pull) PULL=1 ;;
+      --devices) LIST_DEVICES=1 ;;
+      --show-profile) SHOW_PROFILE=$2; shift ;;
+      --measure) MEASURE=$2; shift ;;
+      --fix-names) FIX_NAMES=1 ;;
+      --ls) LS_PATH=$2; shift ;;
       --bundle) fetch_adb "${SELF%/*}"; exit 0 ;;
       --libusb) LIBUSB=1 ;;
       --bench) BENCH=1 ;;
@@ -784,6 +906,10 @@ main() {
   CHUNK=$(( (CHUNK + BS - 1) / BS * BS )); [ $CHUNK -gt 0 ] || CHUNK=$BS
   BENCH_SIZE=$(( (BENCH_SIZE + BS - 1) / BS * BS ))
   [ $BENCH = 1 ] && { bench "$@"; exit; }
+  [ $LIST_DEVICES = 1 ] && { list_devices; exit 0; }
+  [ -z "$LS_PATH" ] || { list_dir "$LS_PATH"; exit 0; }
+  [ -z "$SHOW_PROFILE" ] || { show_profile "$SHOW_PROFILE"; exit 0; }
+  [ -z "$MEASURE" ] || { measure_only "$MEASURE"; exit; }
   [ $# -ge 2 ] || usage 1
 
   local dest=${!#} n=$(($# - 1)) dest_is_dir=0
@@ -884,12 +1010,41 @@ main() {
   [ "$odd" = 0 ] || warn "skipping $(pl "$odd" file) whose names contain tabs or line breaks"
   # Android's shared storage (/sdcard) refuses these characters in file and folder names,
   # like Windows. Such files would only fail after retries, so report them up front.
-  NBADNAME=0
-  if [ $PULL = 0 ] && [ "$(dest_kind "$dest_dir")" = media ]; then
+  NBADNAME=0 NRENAMED=0
+  if [ $PULL = 0 ] && [ "$(dest_kind "$dest_dir")" = media ] && [ $FIX_NAMES = 1 ]; then
+    # --fix-names: each disallowed character in the part of the path under DEST becomes
+    # "_"; a name that then clashes with another file gets "_2", "_3", ... before its
+    # extension. The first pass collects every destination path.
+    T=$T DEST=$dest awk -F'\t' 'BEGIN { OFS = "\t"; n = length(ENVIRON["DEST"]); T = ENVIRON["T"] }
+      FNR == NR { taken[$4] = 1; next }
+      { rel = substr($4, n + 1)
+        if (rel ~ /["*:<>?|\\]/) {
+          gsub(/["*:<>?|\\]/, "_", rel); new = substr($4, 1, n) rel
+          if (new in taken) {
+            base = new; ext = ""
+            if (match(base, /\.[^.\/]*$/)) { ext = substr(base, RSTART); base = substr(base, 1, RSTART - 1) }
+            for (k = 2; ((base "_" k ext) in taken); k++) ;
+            new = base "_" k ext
+          }
+          taken[new] = 1
+          print $4 "\t" new > (T "/renamed")
+          $4 = new
+        }
+        print }' "$T/files" "$T/files" > "$T/files.ok"
+    mv "$T/files.ok" "$T/files"
+    NRENAMED=$(cat "$T/renamed" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$NRENAMED" != 0 ]; then
+      say "Renaming:" "$(pl "$NRENAMED" file) whose names the phone does not allow (those characters become _)"
+      if [ -z "$QUIET" ] && [ $OUT_JSON = 0 ]; then
+        head -5 "$T/renamed" | sed "s/$TAB/  ->  /; s/^/              /" >&2
+        [ "$NRENAMED" -le 5 ] || printf '              ... and %d more\n' $((NRENAMED - 5)) >&2
+      fi
+    fi
+  elif [ $PULL = 0 ] && [ "$(dest_kind "$dest_dir")" = media ]; then
     T=$T DEST=$dest awk -F'\t' 'BEGIN { n = length(ENVIRON["DEST"]); T = ENVIRON["T"] }
       substr($4, n + 1) ~ /["*:<>?|\\]/ {
         print $4 >> (T "/failed")
-        print $4 "\t" "the name contains a character the phone does not allow (one of \" * : < > ? | \\)" >> (T "/errors")
+        print $4 "\tname_not_allowed\tthe name contains a character the phone does not allow (one of \" * : < > ? | \\)" >> (T "/errors")
         next }
       { print }' "$T/files" > "$T/files.ok"
     mv "$T/files.ok" "$T/files"
@@ -898,6 +1053,7 @@ main() {
       warn "$(pl "$NBADNAME" file) with names the phone does not allow (with one of \" * : < > ? | \\) and will be skipped:"
       head -5 "$T/failed" | sed 's/^/    /' >&2
       [ "$NBADNAME" -le 5 ] || printf '    ... and %d more\n' $((NBADNAME - 5)) >&2
+      [ -n "$QUIET" ] || printf '    Use --fix-names to copy them with those characters replaced by _.\n' >&2
     fi
     [ -s "$T/files" ] || die "no files left to copy"
   fi
@@ -909,9 +1065,12 @@ main() {
     "$(jn link_mbps "$([ -n "$LINK" ] && echo $((LINK / 1000000)))")" \
     "$(js direction "$([ $PULL = 1 ] && echo from_phone || echo to_phone)")" \
     "$(js destination "$dest")" "$(jn files "$all_n")" "$(jn bytes "$all_b")"
-  if [ $OUT_JSON = 1 ] && [ -s "$T/errors" ]; then     # names the phone does not allow
-    local a b
-    while IFS=$'\t' read -r a b; do emit file_failed "$(js path "$a")" "$(js error "$b")"; done < "$T/errors"
+  if [ $OUT_JSON = 1 ]; then
+    local a b c
+    [ ! -s "$T/errors" ] ||        # names the phone does not allow
+      while IFS=$'\t' read -r a b c; do emit file_failed "$(js path "$a")" "$(js reason "$b")" "$(js error "$c")"; done < "$T/errors"
+    [ ! -s "$T/renamed" ] ||
+      while IFS=$'\t' read -r a b; do emit renamed "$(js from "$a")" "$(js to "$b")"; done < "$T/renamed"
   fi
 
   if [ $SKIP_EXISTING = 1 ]; then
@@ -936,7 +1095,7 @@ main() {
       if [ ! -s "$T/files" ]; then
         report "Copied:" "nothing to copy; $(pl "$before" file) already $([ $PULL = 1 ] && echo "here" || echo "on the phone")"
         [ "$NBADNAME" = 0 ] ||
-          report "Failed:" "$(pl "$NBADNAME" file) with names the phone does not allow; rename and copy again."
+          report "Failed:" "$(pl "$NBADNAME" file) with names the phone does not allow; rename them, or copy again with --fix-names."
         emit done "$(jn files_copied 0)" "$(jn files_failed "$NBADNAME")" "$(jn bytes 0)" "$(jn seconds 0)"
         finished=1
         local vrc=0
@@ -1160,7 +1319,7 @@ main() {
         set_mtime "$dst" "$mtime"
       else
         printf '%sadbcp: error: failed to finish %s: size %s, expected %s\n' "$CLR" "$dst" "${res:-?}" "$size" >&2
-        printf '%s\t%s\n' "$dst" "could not assemble the file" >> "$T/errors"
+        printf '%s\tassemble_failed\t%s\n' "$dst" "could not assemble the file" >> "$T/errors"
         printf '%s\n' "$dst" >> "$T/failed"
         rm -f "$dst.adbcp-part"
       fi
@@ -1173,7 +1332,7 @@ main() {
     res=$("$ADB" shell "s=\$(stat -c %s $p) && [ \"\$s\" = $size ] && mv -f $p $d && { touch -m -d @$mtime $d 2>/dev/null; echo ok; } || echo \"size \$s, expected $size\"" </dev/null 2>&1 | tr -d '\r' | tail -n 1)
     if [ "$res" != ok ]; then
       printf '%sadbcp: error: failed to finish %s: %s\n' "$CLR" "$dst" "$res" >&2
-      printf '%s\t%s\n' "$dst" "could not assemble the file: $res" >> "$T/errors"
+      printf '%s\tassemble_failed\t%s\n' "$dst" "could not assemble the file: $res" >> "$T/errors"
       printf '%s\n' "$dst" >> "$T/failed"
       "$ADB" shell "rm -f $p" </dev/null >/dev/null 2>&1
     fi
@@ -1191,7 +1350,7 @@ main() {
   else
     report "Copied:" "$((nfiles - nfail)) of $nfiles files, $(human "$done_bytes") in $(dur "$el")"
     if [ "$NBADNAME" = "$nfail" ]; then
-      report "Failed:" "$(pl "$nfail" file) with names the phone does not allow; rename and copy again."
+      report "Failed:" "$(pl "$nfail" file) with names the phone does not allow; rename them, or copy again with --fix-names."
     else
       report "Failed:" "$(pl "$nfail" file) (listed above). Run the same command with --skip-existing to retry them."
       [ "$NBADNAME" = 0 ] || report "" "$NBADNAME of them have names the phone does not allow; rename those first."
