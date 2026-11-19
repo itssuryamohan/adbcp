@@ -60,6 +60,16 @@ To select items:
 2. Select the items in the other pane.
 3. Click **Copy to phone →** or **← Copy to Mac**.
 
+To the phone, you can choose how the app sets its speed settings:
+
+| Button | What it does |
+|---|---|
+| **Copy to phone →** | Uses the settings measured earlier for this phone, cable, and kind of folder. If there are none, it uses built-in settings. It never measures. |
+| **Calibrate & copy →** | Measures this phone, cable, and folder first (about 10 seconds, longer on Wi-Fi), saves the result, then copies. Use it the first time, or after you change the cable or the connection. |
+
+Hold the pointer over **Copy to phone →** to see which measurement it uses. Copies to
+the Mac always use fixed settings, so that side has no Calibrate button.
+
 You can also drag the items to the other pane. Drop them on a folder to copy into that
 folder. You can drag files from Finder onto the phone pane.
 

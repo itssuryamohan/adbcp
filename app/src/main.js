@@ -50,6 +50,7 @@ const state = {
   adbMissing: false,          // no adb, and the user has not agreed to download it
   adbError: '',
   autoDownloadAdb: false,     // test hook only
+  profile: null,              // the saved measurement for the phone pane's folder (show_profile)
 };
 
 // ---------------------------------------------------------------- formatting ---
@@ -434,7 +435,7 @@ function makePane(side) {
   return {
     side, root,
     list: q('.entries'), path$: q('.path'), places: q('.places'), up: q('.up'), reload: q('.reload'),
-    mkdir: q('.mkdir'), rename: q('.rename'), del: q('.delete'), copy: q('.copy'),
+    mkdir: q('.mkdir'), rename: q('.rename'), del: q('.delete'), copy: q('.copy'), calibrate: q('.calibrate'),
     selInfo: q('.sel-info'), hint: q('.drop-hint'), heads: [...root.querySelectorAll('.list-head button')],
     path: '', entries: [], shown: [], selected: new Set(), anchor: -1,
     sort: { key: 'name', dir: 1 }, message: '', loadSeq: 0,
@@ -552,6 +553,13 @@ function updatePaneControls(pane) {
   pane.up.disabled = !ready || pane.path === '/';
   pane.reload.disabled = pane.path$.disabled = pane.places.disabled = !ready;
   pane.copy.disabled = !sel.length || !currentDevice() || state.measuring;
+  if (pane.calibrate) {
+    pane.calibrate.disabled = pane.copy.disabled;
+    const p = state.profile;
+    pane.copy.title = !p ? '' : p.saved
+      ? `Copy with the settings measured on ${p.date} for ${KIND_NAMES[p.kind] || p.kind}`
+      : 'Not measured yet: copies with built-in settings. Calibrate & copy measures first.';
+  }
 }
 
 function setActive(side) {
@@ -681,7 +689,7 @@ async function namesIn(side, dir) {
 }
 
 // Copies `sources` (on side `from`) into folder `destDir` on the other side.
-async function copyItems(from, sources, destDir) {
+async function copyItems(from, sources, destDir, { calibrate = false } = {}) {
   if (!sources.length) return;
   if (!currentDevice()) { showResult('Connect a phone first.', false); return; }
   const to = other(from);
@@ -705,15 +713,17 @@ async function copyItems(from, sources, destDir) {
     skipExisting = choice === 'skip';
   }
   const where = to === 'phone' ? 'the phone' : 'this Mac';
+  const what = sources.length === 1 ? `“${basename(sources[0])}”` : plural(sources.length, 'item');
   enqueue({
     pull: from === 'phone', sources, dest: withSlash(destDir), destSide: to, skipExisting, fixNames: false,
-    label: `Copying ${sources.length === 1 ? `“${basename(sources[0])}”` : plural(sources.length, 'item')} to ${destDir} on ${where}`,
+    calibrate: calibrate && from === 'mac',
+    label: `${calibrate && from === 'mac' ? 'Calibrating, then copying' : 'Copying'} ${what} to ${destDir} on ${where}`,
   });
 }
 
-function copySelection(from) {
+function copySelection(from, options) {
   const pane = panes[from];
-  copyItems(from, selectedEntries(pane).map((e) => e.path), panes[other(from)].path);
+  copyItems(from, selectedEntries(pane).map((e) => e.path), panes[other(from)].path, options);
 }
 
 function enqueue(job) {
@@ -768,6 +778,7 @@ async function startNext() {
     burst: ui.burst.checked,
     libusb: ui.libusb.checked,
     force: ui.force.checked,
+    calibrate: !job.pull && !!job.calibrate,
   };
   try {
     await invoke('start_copy', { req });
@@ -824,6 +835,8 @@ function onEvent(e) {
       break;
     case 'calibration':
       log(`Measured this phone: ${plural(e.streams, 'parallel transfer')} for large files.`);
+      state.profileKey = '';
+      refreshTuning(true);
       ui.stats.textContent = 'Measured this phone. Starting the copy…';
       break;
     case 'compression_test':
@@ -937,7 +950,7 @@ function showTuning(text, cls = '', title = '') {
 async function refreshTuning(force = false) {
   const d = currentDevice();
   if (state.measuring) return;
-  if (!d) { state.profileKey = ''; showTuning('Connect a phone to see its measurements.'); return; }
+  if (!d) { state.profileKey = ''; state.profile = null; showTuning('Connect a phone to see its measurements.'); return; }
   const dest = panes.phone.path || '/sdcard';
   const key = `${d.serial}|${destKind(dest)}`;
   if (!force && key === state.profileKey) return;
@@ -951,10 +964,13 @@ async function refreshTuning(force = false) {
 }
 
 function describeProfile(p) {
+  state.profile = p;
+  for (const pane of Object.values(panes)) updatePaneControls(pane);
   const where = KIND_NAMES[p.kind] || p.kind;
   const fixed = ' Copies from the phone use fixed settings (8 parallel transfers).';
   if (!p.saved) {
-    showTuning(`Not measured yet for this phone and ${where}. It is measured automatically before the first large copy to the phone (about 10 seconds), or now.${fixed}`);
+    showTuning(`Not measured yet for this phone and ${where}. Copy uses built-in settings. ` +
+      `Calibrate & copy, or Measure now, measures first (about 10 seconds).${fixed}`);
     return;
   }
   const detail = `Large files: ${numbersAt(p.large_mib_per_second)} MiB/s on 2 · 4 · 8 transfers. ` +
@@ -1146,6 +1162,7 @@ for (const pane of Object.values(panes)) {
   pane.rename.addEventListener('click', () => renameItem(pane));
   pane.del.addEventListener('click', () => deleteItems(pane));
   pane.copy.addEventListener('click', () => copySelection(pane.side));
+  if (pane.calibrate) pane.calibrate.addEventListener('click', () => copySelection(pane.side, { calibrate: true }));
   for (const h of pane.heads) {
     h.addEventListener('click', () => {
       pane.sort = pane.sort.key === h.dataset.sort ? { key: h.dataset.sort, dir: -pane.sort.dir } : { key: h.dataset.sort, dir: 1 };
@@ -1235,7 +1252,8 @@ listen('engine-exit', ({ payload }) => onExit(payload));
     if (job.pull) await loadPane(panes.mac, job.dest); else await loadPane(panes.phone, job.dest);
     enqueue({
       pull: !!job.pull, sources: job.sources, dest: withSlash(normalize(job.dest)), destSide: job.pull ? 'mac' : 'phone',
-      skipExisting: !!job.skipExisting, fixNames: !!job.fixNames, label: `Copying (test run) to ${job.dest}`,
+      skipExisting: !!job.skipExisting, fixNames: !!job.fixNames, calibrate: !!job.calibrate,
+      label: `Copying (test run) to ${job.dest}`,
     });
   }
 })();

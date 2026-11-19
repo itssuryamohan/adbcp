@@ -107,6 +107,7 @@ uses it for later copies.
 - A copy of 2 GiB or more, or 1,000 files or more, measures first if no result exists.
 - Smaller copies use built-in values until a measurement exists.
 - `--recalibrate` measures again before the copy.
+- `--no-calibrate` never measures. adbcp uses the saved result, or built-in values.
 - `--measure PATH` measures now, without a copy.
 - `--show-profile PATH` shows the saved result for that destination.
 
@@ -163,6 +164,7 @@ parallel streams. This made Wi-Fi copies about twice as fast in tests.
 | `--split-min SIZE` | Split files that do not compress, from this size. The default is `256M`. `0` splits all such files. |
 | `--no-split` | Never split files. This also turns off resuming inside files. |
 | `--recalibrate` | Measure this phone, cable, and destination again. |
+| `--no-calibrate` | Never measure before this copy. Use the saved measurement, or built-in values. |
 | `--burst` | Experimental. Restart adb in burst mode. It was slower on real copies in tests. |
 | `--libusb` | Experimental. Restart adb with the libusb USB backend. |
 | `--bench [DIR]` | Compare a single push with split pushes. Set the test file size with `--bench-size`. |

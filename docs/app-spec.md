@@ -139,7 +139,8 @@ deletes, after a confirmation. Shift-Command-N makes a new folder.
 
 ### 3.3 Copying
 
-- **Copy to phone →** copies the items selected in the Mac pane into the folder open in the phone pane.
+- **Copy to phone →** copies the items selected in the Mac pane into the folder open in the phone pane. It never measures first (`--no-calibrate`): it uses the saved measurement, or built-in settings. Its tooltip names the measurement it uses.
+- **Calibrate & copy →** does the same, but measures first (`--recalibrate`, about 10 seconds) and saves the result. The Tuning row then shows the new measurement.
 - **← Copy to Mac** copies in the other direction.
 
 **Dragging.**
@@ -200,6 +201,7 @@ The gear button opens the settings.
 | When names already exist | Ask | Replace: no option. Skip existing: `--skip-existing`. |
 | Show hidden files | Off | — |
 | Tuning: measurements and **Measure now** | — | `--show-profile`, `--measure` |
+| (button) **Copy to phone →** / **Calibrate & copy →** | Copy | `--no-calibrate` / `--recalibrate` |
 | Parallel transfers | Automatic (measured) | `-j N` |
 | Compression | Automatic (tests the data) | `-z none\|zstd\|lz4` |
 | Split very large files | Automatic | `--no-split` when off |
@@ -437,6 +439,7 @@ Decided:
 5. Delete on the Mac moves items to the Trash. Delete on the phone is permanent and always asks first. The app does not delete storage roots or standard folders.
 6. Copies onto existing names ask Replace / Skip existing / Cancel by default.
 7. From version 0.3.0, the app does not include Google's adb. It uses an installed adb, or asks before it downloads Google's package. Thus the app can be shared without passing on Google's software.
+8. The user chooses when to measure: **Copy** or **Calibrate & copy**. The app never lets the engine measure by itself. The user decides when to spend the 10 seconds or more that measuring takes.
 
 Open:
 

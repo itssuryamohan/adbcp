@@ -103,6 +103,8 @@ options:
   --bench [DIR]     benchmark single push vs split -j 2/4/8 with a random file in DIR
                     (default /sdcard/Download); size via --bench-size (default 1G)
   --recalibrate     measure this phone, link and destination again (see "tuning")
+  --no-calibrate    never measure before this copy: use the saved measurement, or the
+                    built-in settings if there is none
   --dry-run         print the transfer plan and exit
   --adb-status      show which adb would be used (without downloading anything)
   --get-adb         download Google's platform-tools into the cache now
@@ -1048,7 +1050,7 @@ bench() {
 # -------------------------------------------------------------------- main ---
 main() {
   J=8 COMP=auto CHUNK=$((128 * BS)) SPLIT_MIN=$((256 * BS)) NO_SPLIT=0 VERIFY=0
-  WIFI_SCAN=0 WIFI_OP="" CHUNK_SET=0
+  WIFI_SCAN=0 WIFI_OP="" CHUNK_SET=0 NO_CAL=0
   ADB_STATUS=0 GET_ADB=0 PULL=0 LIST_DEVICES=0 LS_PATH="" SHOW_PROFILE="" MEASURE="" FIX_NAMES=0 PHONE_OP="" J_SET=0 RECAL=0 SPLIT_SET=0 SKIP_EXISTING=0 DRY=0 FORCE=0 BURST=0 LIBUSB=0 BENCH=0 BENCH_SIZE=$((1024 * BS))
   local args=() a
   while [ $# -gt 0 ]; do
@@ -1068,6 +1070,7 @@ main() {
       --force) FORCE=1 ;;
       --burst) BURST=1 ;;
       --recalibrate) RECAL=1 ;;
+      --no-calibrate) NO_CAL=1 ;;
       --pull) PULL=1 ;;
       --devices) LIST_DEVICES=1 ;;
       --wifi-scan) WIFI_SCAN=1 ;;
@@ -1320,7 +1323,7 @@ main() {
     local tot0 nf0 cbytes
     tot0=$(awk '{ s += $1 } END { printf "%.0f", s }' "$T/files"); nf0=$(wc -l < "$T/files" | tr -d ' ')
     if [ $RECAL = 1 ] ||
-       { [ "$TUNING" = "built-in defaults" ] && { [ "$tot0" -ge $CAL_MIN_BYTES ] || [ "$nf0" -ge $CAL_MIN_FILES ]; }; }; then
+       { [ $NO_CAL = 0 ] && [ "$TUNING" = "built-in defaults" ] && { [ "$tot0" -ge $CAL_MIN_BYTES ] || [ "$nf0" -ge $CAL_MIN_FILES ]; }; }; then
       "$ADB" shell "mkdir -p $(rq "$dest_dir")" </dev/null >/dev/null 2>&1
       calibrate "$dest_dir" || true
     fi

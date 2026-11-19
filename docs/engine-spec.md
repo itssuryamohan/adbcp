@@ -84,7 +84,8 @@ destination on the phone. The engine measures this itself.
 
 - **Direction:** the engine measures only for copies to the phone. Reading from a phone is more even than writing to it. Thus copies from the phone use fixed values: 8 parallel transfers, and groups of small files on 4.
 - **When:** the engine measures the first time that a large copy goes to a phone. A large copy has 2 GB or more, or 1,000 files or more. The engine measures again for each new connection type and each new kind of destination. Smaller copies use built-in values until a measurement exists.
-- **On request:** `--recalibrate` measures again before a copy. In the app, **Measure now** does this.
+- **On request:** `--recalibrate` measures again before a copy. In the app, **Calibrate & copy** and **Measure now** do this.
+- **Never:** `--no-calibrate` turns off the automatic measurement for this copy. The engine uses the saved measurement, or built-in values. The app always passes `--no-calibrate` or `--recalibrate`, so the user chooses.
 - **Duration:** about 10 seconds. The engine reports the result in a `calibration` event.
 - **Tests:** the engine copies medium-size test files with 2, 4, and 8 parallel transfers. It copies many tiny test files. It also reads the number of processor cores in the phone.
 - **Storage:** the engine saves the results on the Mac in `~/Library/Caches/adbcp/profiles`. Later copies use them.

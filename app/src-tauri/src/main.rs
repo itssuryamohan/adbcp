@@ -330,6 +330,10 @@ struct CopyRequest {
     burst: bool,
     libusb: bool,
     force: bool,
+    /// Measure the phone, cable and destination first (--recalibrate). Otherwise the
+    /// engine never measures by itself (--no-calibrate): the user chooses.
+    #[serde(default)]
+    calibrate: bool,
 }
 
 /// Starts a copy. Options are built from typed fields, so the window cannot pass
@@ -384,6 +388,7 @@ fn start_copy(app: AppHandle, running: State<Running>, req: CopyRequest) -> Resu
     if req.force {
         cmd.arg("--force");
     }
+    cmd.arg(if req.calibrate && !req.pull { "--recalibrate" } else { "--no-calibrate" });
     cmd.arg("--").args(&req.sources).arg(&req.dest);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
