@@ -643,6 +643,10 @@ function onEvent(e) {
     case 'skip':
       log(`Skipping ${plural(e.files, 'file')} already there.`);
       break;
+    case 'resume':
+      log(`Resuming ${plural(e.files, 'file')} sent in parts earlier: ${size(e.bytes)} is already there.`);
+      ui.summary.textContent += `\nResuming ${plural(e.files, 'file')} (${size(e.bytes)} already there)`;
+      break;
     case 'calibration':
       log(`Measured this phone: ${plural(e.streams, 'parallel transfer')} for large files.`);
       ui.stats.textContent = 'Measured this phone. Starting the copy…';

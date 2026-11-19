@@ -48,6 +48,33 @@ Show the plan without copying:
 adbcp --dry-run ~/Documents/Games/MyGame /sdcard/Games/
 ```
 
+## Continue a stopped copy
+
+adbcp sends large files in parts. It records each part that arrives. If a copy stops,
+run the same command again. adbcp then sends only the missing parts.
+
+This works after Ctrl-C, a cut cable, a crash, or a restart of the Mac.
+
+adbcp sends a file in parts in these cases:
+
+- The file is 256 MiB or larger, and it does not compress. Examples are video, archives, and encrypted game packages. adbcp tests a 3 MiB sample of files with other extensions.
+- The file is 4 GiB or larger.
+
+A stopped copy keeps `NAME.adbcp-part` files at the destination. adbcp keeps the records
+in `~/Library/Caches/adbcp/parts`. It deletes records that are older than 30 days.
+
+adbcp starts a file again from the beginning in these cases:
+
+- The source file changed (size or modification time).
+- You changed the part size (`--chunk`).
+- The `.adbcp-part` file is missing or shorter than expected.
+
+`--no-split` and `-j 1` send each file in one piece. Then a stopped file starts again
+from the beginning.
+
+To finish the other files too, add `--skip-existing`. It skips files that are already
+complete.
+
 ## Where the files go
 
 adbcp follows the rules of `cp`:
@@ -112,8 +139,8 @@ Copies from the phone use fixed values. They do not measure.
 | `-j N` | Use N parallel transfers for large files. This replaces the measured value. |
 | `-z ALGO` | Compression: `auto`, `none`, `lz4`, `zstd`, or `brotli`. The default `auto` tests the data. |
 | `--chunk SIZE` | Part size for split files. The default is `128M`. |
-| `--split-min SIZE` | Split files of this size or larger. The default is `256M`. `0` splits all files. |
-| `--no-split` | Never split files. |
+| `--split-min SIZE` | Split files that do not compress, from this size. The default is `256M`. `0` splits all such files. |
+| `--no-split` | Never split files. This also turns off resuming inside files. |
 | `--recalibrate` | Measure this phone, cable, and destination again. |
 | `--burst` | Experimental. Restart adb in burst mode. It was slower on real copies in tests. |
 | `--libusb` | Experimental. Restart adb with the libusb USB backend. |

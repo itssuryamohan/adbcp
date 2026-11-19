@@ -9,6 +9,11 @@
 #     stream in parallel straight into their final offsets on the device
 #     (`dd seek=`), written to a .adbcp-part file and renamed into place only
 #     after every chunk landed. No reassembly pass, no half-written files.
+#     Large files without a telling extension are sampled (gzip -1 on 3 MiB) to find
+#     data that does not compress; files of 4 GiB or more are split in any case.
+#   * Resume: each chunk that landed is recorded in the cache (parts/). A copy that
+#     stops keeps its .adbcp-part files; the next run of the same copy sends only the
+#     missing chunks, if the source (path, size, time) and the part size are unchanged.
 #   * Compression only where it pays off: media/archives go raw, everything
 #     else uses zstd (lz4 if the device lacks zstd).
 #   * Detects a USB 2.0 link (a very common cable problem) and warns; there a
@@ -43,6 +48,7 @@ set -uo pipefail
 
 VERSION=1.0
 BS=1048576                       # dd block size; chunk offsets are multiples of this
+PARTS_MIN=${ADBCP_PARTS_MIN:-$((4096 * BS))}   # compressible files this big are also sent in parts (resumable)
 INCOMPRESSIBLE=' mp4 m4v mkv mov avi webm wmv flv 3gp ts m2ts mts mp3 m4a aac ogg oga opus flac wma wav
  jpg jpeg png gif webp heic heif avif dng zip 7z rar gz tgz bz2 xz zst lz4 br apk apks xapk aab obb jar
  dmg pdf epub docx xlsx pptx odt '
@@ -99,7 +105,7 @@ options:
   -q                quiet: only errors and the final summary lines
   -v, --verbose     also list every file (or group of small files) as it finishes
   --json            for programs: one JSON object per line on stdout (start, skip,
-                    calibration, compression_test, plan, progress, file_failed, done,
+                    resume, calibration, compression_test, plan, progress, file_failed, done,
                     verify_start, verify_problem, verify_done, warning, error)
   -h, --help        this help
 
@@ -112,6 +118,12 @@ adbcp/profiles and reused. Copies of 2 GiB or 1000 files measure first when ther
 is no profile; smaller ones use defaults. Compression is chosen by test-sending a
 sample of the copy's own data when it has 2 GiB or more of compressible files.
 -j overrides the measured big-file streams.
+
+resume: large files go in parts when they do not compress (video, archives, and other
+files whose sample does not shrink) or are 4 GiB or more. If such a copy stops (Ctrl-C,
+cable, crash), the parts that landed stay in NAME.adbcp-part and are recorded in
+~/Library/Caches/adbcp/parts. Running the same copy again sends only the missing parts.
+A changed source starts over. --no-split and -j 1 turn parts, and so resuming, off.
 
 adb lookup: \$ADB, then ./platform-tools/adb next to adbcp, adb in PATH, Homebrew
 (/opt/homebrew/bin, /usr/local/bin), Android Studio's SDK (\$ANDROID_HOME or
@@ -224,7 +236,8 @@ job() {
   case $kind in
     chunk*)
       if [ -n "$ADBCP_PULL" ]; then rcmd="dd if=$(rq "$src") bs=$BS skip=$skip count=$count 2>/dev/null"
-      else rcmd="o=\$(dd of=$(rq "$dst.adbcp-part") bs=$BS seek=$skip conv=notrunc 2>&1) || { echo \"\$o\" >&2; exit 1; }"; fi ;;
+      else rcmd="o=\$(dd of=$(rq "$dst.adbcp-part") bs=$BS seek=$skip conv=notrunc 2>&1) || { echo \"\$o\" >&2; exit 1; }
+        case \"\$o\" in *'records out'?'$bytes bytes'*) ;; *) echo \"incomplete part: \$o\" >&2; exit 1 ;; esac"; fi ;;
     batch)
       while IFS= read -r f; do files+=("$f"); done < "$src"
       [ -z "$ADBCP_PULL" ] || btmp="$dst/.adbcp-batch.$$" ;;
@@ -282,6 +295,9 @@ job() {
     batch) printf '%s %s\n' "$bytes" "$count" ;;
     *)     printf '%s 1 %s\n' "$bytes" "${kind#*/}" ;;
   esac >> "$ADBCP_TMP/done"
+  case $kind in
+    chunk*) f=${kind#chunk}; printf '%s\n' "${f%/*}" >> "$(part_record "$([ -n "$ADBCP_PULL" ] && echo pull || echo push)" "$dst")" ;;
+  esac
   [ -z "$run" ] || rm -f "$run"
   if [ -n "$ADBCP_VERBOSE" ]; then
     t1=$(now)
@@ -632,13 +648,16 @@ probe_compression() {
     r=$(value_at "$algo" "$rates"); results="$results $algo:$r"
     if [ "$r" -gt "$bestr" ]; then best=$algo; bestr=$r; fi
   done
-  # Keep the default (zstd, measured best on game data) unless another beats it by 5%.
+  # Keep the default (zstd) unless another beats it by 10%. This test sends on one stream,
+  # which undervalues compression: a real copy fills the link with 8 streams, where fewer
+  # bytes count more. Game data (S23 Ultra): the test put "none" 6% ahead of zstd in one
+  # run of four, but the real copy took 26 s with zstd and 32 s without.
   noner=$(value_at "$AUTO_ALGO" "$rates")
-  if [ -n "$noner" ] && [ "$best" != "$AUTO_ALGO" ] && [ $((bestr * 100)) -lt $((noner * 105)) ]; then
+  if [ -n "$noner" ] && [ "$best" != "$AUTO_ALGO" ] && [ $((bestr * 100)) -lt $((noner * 110)) ]; then
     best=$AUTO_ALGO
   fi
   AUTO_ALGO=$best
-  COMP_TEST=$(printf '%s\n' $results | awk -F: '{ printf "%s%s %s", NR > 1 ? ", " : "", $1, $2 }')
+  COMP_TEST=$(printf '%s\n' $results | awk -F: '{ printf "%s%s %s", (NR > 1 ? ", " : ""), $1, $2 }')
   emit compression_test "$(jpairs mib_per_second "${results# }")" "$(js choice "$AUTO_ALGO")"
 }
 
@@ -648,6 +667,17 @@ cache_dir() {
   if [ "$(uname)" = Darwin ]; then echo "$HOME/Library/Caches/adbcp"
   else echo "${XDG_CACHE_HOME:-$HOME/.cache}/adbcp"; fi
 }
+
+# Resume records for files sent in parts: one small file per destination, in the cache.
+# Line 1 names the source ("v1 SRC SIZE MTIME PARTSIZE", tab-separated); it must match
+# for a later run to resume. Every further line is the number of a part that landed.
+# part_record push|pull DEST
+part_record() {
+  printf '%s/parts/%s' "$(cache_dir)" \
+    "$(printf '%s|%s|%s\n' "$1" "${ANDROID_SERIAL:-}" "$2" | cksum | awk '{ print $1 "-" $2 }')"
+}
+part_header() { printf 'v1\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$CHUNK"; }   # SRC SIZE MTIME
+has_progress() { [ -f "$1" ] && [ "$(wc -l < "$1" | tr -d ' ')" -gt 1 ]; }
 
 is_google_signed() {
   local info
@@ -1252,23 +1282,44 @@ main() {
   [ $NO_SPLIT = 0 ] && [ $J -gt 1 ] && has_feat shell_v2 && split_ok=1
   # A saturated link gains nothing from more streams; compression helps instead.
   [ $SLOW_LINK = 1 ] && [ $SPLIT_SET = 0 ] && split_ok=0
-  : > "$T/big"; : > "$T/small"; : > "$T/dirs"
+  : > "$T/big"; : > "$T/small"; : > "$T/dirs"; : > "$T/incomp"
+  # Large files whose name does not tell: test a sample (3 MiB) of each, so that data
+  # that does not compress (encrypted game packages, disk images) is split like video
+  # (parallel and resumable) instead of going through zstd on a single stream.
+  if [ $split_ok = 1 ] && [ "$COMP" = auto ] && [ "$AUTO_ALGO" != none ]; then
+    local size mtime src dst ext c o inc
+    inc=" $(printf '%s' "$INCOMPRESSIBLE" | tr '\n' ' ') "
+    while IFS=$'\t' read -r size mtime src dst; do
+      [ "$size" -ge "$SPLIT_MIN" ] && [ "$size" -ge $((64 * BS)) ] || continue
+      ext=${src##*/}; case $ext in *.*) ext=$(printf '%s' "${ext##*.}" | tr 'A-Z' 'a-z') ;; *) ext=- ;; esac
+      case $inc in *" $ext "*) continue ;; esac
+      if [ $PULL = 1 ]; then   # one adb call reads the three samples on the phone
+        c=$("$ADB" exec-out "for o in $((size / BS / 4)) $((size / BS / 2)) $((size / BS * 3 / 4)); do dd if=$(rq "$src") bs=$BS skip=\$o count=1 2>/dev/null; done" </dev/null | gzip -1 | wc -c)
+      else
+        c=$(for o in 1 2 3; do dd if="$src" bs=$BS skip=$((size / BS * o / 4)) count=1 2>/dev/null; done | gzip -1 | wc -c)
+      fi
+      [ "$c" -lt $((3 * BS * 97 / 100)) ] || printf '%s\n' "$src" >> "$T/incomp"
+    done < "$T/files"
+  fi
   T=$T COMP=$COMP AUTO_ALGO=$AUTO_ALGO INCOMPRESSIBLE=$INCOMPRESSIBLE SPLIT_OK=$split_ok \
-  SPLIT_MIN=$SPLIT_MIN CHUNK=$CHUNK BS=$BS SMALL_MAX=$SMALL_MAX BATCH_FILES=$BATCH_FILES \
+  SPLIT_MIN=$SPLIT_MIN CHUNK=$CHUNK BS=$BS SMALL_MAX=$SMALL_MAX BATCH_FILES=$BATCH_FILES PARTS_MIN=$PARTS_MIN \
   awk -F'\t' '
     BEGIN {
       OFS = "\t"; T = ENVIRON["T"]; comp = ENVIRON["COMP"]; auto = ENVIRON["AUTO_ALGO"]
       n = split(ENVIRON["INCOMPRESSIBLE"], l, /[ \n]+/); for (i = 1; i <= n; i++) if (l[i] != "") inc[l[i]] = 1
+      while ((getline l1 < (T "/incomp")) > 0) tested[l1] = 1
       split_ok = ENVIRON["SPLIT_OK"] + 0; smin = ENVIRON["SPLIT_MIN"] + 0; chunk = ENVIRON["CHUNK"] + 0
       bs = ENVIRON["BS"] + 0; small = ENVIRON["SMALL_MAX"] + 0; maxb = ENVIRON["BATCH_FILES"] + 0
+      pmin = ENVIRON["PARTS_MIN"] + 0
     }
     {
       size = $1 + 0; src = $3; dst = $4
       sb = src; sub(/.*\//, "", sb); db = dst; sub(/.*\//, "", db)
       algo = comp
-      if (comp == "auto") { ext = sb; sub(/.*\./, "", ext); algo = (tolower(ext) in inc) ? "none" : auto }
-      # Split streams cannot compress, so only incompressible files are split.
-      if (split_ok && size >= smin && size > chunk && algo == "none") {
+      if (comp == "auto") { ext = sb; sub(/.*\./, "", ext); algo = (tolower(ext) in inc || src in tested) ? "none" : auto }
+      # Split streams cannot compress, so files are split when they do not compress, or
+      # when they are so big (PARTS_MIN) that being able to resume matters more.
+      if (split_ok && size > chunk && ((size >= smin && algo == "none") || size >= pmin)) {
         cb = chunk / bs; nch = int((int((size + bs - 1) / bs) + cb - 1) / cb)
         for (k = 0; k < nch; k++) {
           skip = k * cb
@@ -1304,6 +1355,17 @@ main() {
     }' "$T/files"
   sort -t "$(printf '\t')" -k1,1nr -o "$T/big" "$T/big"
   total=$(awk '{ s += $1 } END { printf "%.0f", s }' "$T/files")
+  resume_scan
+  if [ -s "$T/resume" ]; then
+    local rfiles rbytes
+    rfiles=$(cut -f1 "$T/resume" | sort -u | wc -l | tr -d ' ')
+    rbytes=$(awk -F'\t' '{ s += $4 } END { printf "%.0f", s }' "$T/resume")
+    total=$((total - rbytes))
+    cut -f1 "$T/resume" | sort -u > "$T/resume.files"
+    awk -F'\t' '{ print 0, 1, $3 }' "$T/resume" >> "$T/done"   # count those parts as done
+    say "Resuming:" "$(pl "$rfiles" file) sent in parts earlier; $(human "$rbytes") is already there"
+    emit resume "$(jn files "$rfiles")" "$(jn bytes "$rbytes")"
+  fi
   nfiles=$(wc -l < "$T/files" | tr -d ' ')
   if [ $J = 1 ]; then cat "$T/small" >> "$T/big"; : > "$T/small"; fi   # -j 1: strictly one stream
   local dirs_sync=0; [ $J = 1 ] && [ -s "$T/dirs" ] && dirs_sync=1          # no small pool to create them
@@ -1374,12 +1436,16 @@ main() {
       die "cannot create folders under $dest_dir"
     local size mtime src dst
     while IFS=$'\t' read -r size mtime src dst; do
+      is_resumed "$dst" && continue
       rm -f "$dst.adbcp-part" && : > "$dst.adbcp-part" || die "cannot write $dst.adbcp-part"
+      new_record pull "$src" "$size" "$mtime" "$dst"
     done < "$T/split"
   elif [ -s "$T/split" ]; then
     local prep="" size mtime src dst
     while IFS=$'\t' read -r size mtime src dst; do
+      if is_resumed "$dst"; then prep="$prep mkdir -p $(rq "${dst%/*}") || exit 1;"; continue; fi
       prep="$prep mkdir -p $(rq "${dst%/*}") && rm -f $(rq "$dst.adbcp-part") || exit 1;"
+      new_record push "$src" "$size" "$mtime" "$dst"
     done < "$T/split"
     "$ADB" shell "$prep" </dev/null || die "cannot prepare destination on device"
   fi
@@ -1420,14 +1486,19 @@ main() {
   [ -z "$PROBE_RM_PID" ] || { wait "$PROBE_RM_PID" 2>/dev/null; PROBE_RM=""; }
 
   # Move completed split files into place.
-  local res size mtime src dst
+  local res size mtime src dst rec
   while IFS=$'\t' read -r size mtime src dst; do
     if [ $PULL = 1 ]; then
-      if grep -Fxq -- "$dst" "$T/failed"; then rm -f "$dst.adbcp-part"; continue; fi
+      rec=$(part_record pull "$dst")
+      if grep -Fxq -- "$dst" "$T/failed"; then
+        has_progress "$rec" && continue        # keep the part file: the next run resumes it
+        rm -f "$dst.adbcp-part" "$rec"; continue
+      fi
       res=$(fsize "$dst.adbcp-part")
       if [ "$res" = "$size" ] && mv -f "$dst.adbcp-part" "$dst"; then
-        set_mtime "$dst" "$mtime"
+        set_mtime "$dst" "$mtime"; rm -f "$rec"
       else
+        rm -f "$rec"
         printf '%sadbcp: error: failed to finish %s: size %s, expected %s\n' "$CLR" "$dst" "${res:-?}" "$size" >&2
         printf '%s\tassemble_failed\t%s\n' "$dst" "could not assemble the file" >> "$T/errors"
         printf '%s\n' "$dst" >> "$T/failed"
@@ -1435,11 +1506,13 @@ main() {
       fi
       continue
     fi
-    local p d; p=$(rq "$dst.adbcp-part"); d=$(rq "$dst")
+    local p d; p=$(rq "$dst.adbcp-part"); d=$(rq "$dst"); rec=$(part_record push "$dst")
     if grep -Fxq -- "$dst" "$T/failed"; then
-      "$ADB" shell "rm -f $p" </dev/null >/dev/null 2>&1; continue
+      has_progress "$rec" && continue          # keep the part file: the next run resumes it
+      rm -f "$rec"; "$ADB" shell "rm -f $p" </dev/null >/dev/null 2>&1; continue
     fi
     res=$("$ADB" shell "s=\$(stat -c %s $p) && [ \"\$s\" = $size ] && mv -f $p $d && { touch -m -d @$mtime $d 2>/dev/null; echo ok; } || echo \"size \$s, expected $size\"" </dev/null 2>&1 | tr -d '\r' | tail -n 1)
+    rm -f "$rec"
     if [ "$res" != ok ]; then
       printf '%sadbcp: error: failed to finish %s: %s\n' "$CLR" "$dst" "$res" >&2
       printf '%s\tassemble_failed\t%s\n' "$dst" "could not assemble the file: $res" >> "$T/errors"
@@ -1463,6 +1536,7 @@ main() {
       report "Failed:" "$(pl "$nfail" file) with names the phone does not allow; rename them, or copy again with --fix-names."
     else
       report "Failed:" "$(pl "$nfail" file) (listed above). Run the same command with --skip-existing to retry them."
+      kept_parts_note
       [ "$NBADNAME" = 0 ] || report "" "$NBADNAME of them have names the phone does not allow; rename those first."
     fi
   fi
@@ -1473,19 +1547,84 @@ main() {
   [ "$nfail" = 0 ] && [ $vfail = 0 ]
 }
 
+# After a cancel or another early exit: remove partial files, except files sent in parts
+# that have parts recorded. Those stay, so that running the same copy again resumes them.
 cleanup_parts() {
-  local cmd="" size mtime src dst d
+  local cmd="" size mtime src dst d dir rec
+  dir=$([ $PULL = 1 ] && echo pull || echo push)
+  : > "$T/kept"
+  while IFS=$'\t' read -r size mtime src dst; do
+    rec=$(part_record $dir "$dst")
+    if has_progress "$rec"; then printf '%s\n' "$dst" >> "$T/kept"; continue; fi
+    rm -f "$rec"
+  done < "$T/split"
   if [ $PULL = 1 ]; then
     # Partial files of whole-file and split pulls, and scratch folders of batch pulls.
-    cat "$T/big" "$T/small" 2>/dev/null | awk -F'\t' '$2 != "batch" { print $5 ".adbcp-part" }' |
+    cat "$T/big" "$T/small" 2>/dev/null | awk -F'\t' 'FILENAME == ARGV[1] { kept[$0] = 1; next }
+      $2 != "batch" && !($5 in kept) { print $5 ".adbcp-part" }' "$T/kept" - |
       tr '\n' '\0' | xargs -0 rm -f
     cat "$T/big" "$T/small" 2>/dev/null | awk -F'\t' '$2 == "batch" { print $5 }' | sort -u |
       while IFS= read -r d; do [ -n "$d" ] && rm -rf "$d"/.adbcp-batch.*; done
-    return 0
+  elif [ -s "$T/split" ]; then
+    while IFS=$'\t' read -r size mtime src dst; do
+      grep -Fxq -- "$dst" "$T/kept" || cmd="$cmd rm -f $(rq "$dst.adbcp-part");"
+    done < "$T/split"
+    [ -z "$cmd" ] || "$ADB" shell "$cmd" </dev/null >/dev/null 2>&1
   fi
+  kept_parts_note
+}
+
+# Tell the user about partial files kept for resuming (after a cancel or failed parts).
+kept_parts_note() {
+  local n dir dst
+  dir=$([ $PULL = 1 ] && echo pull || echo push)
+  n=$(while IFS=$'\t' read -r _ _ _ dst; do has_progress "$(part_record $dir "$dst")" && echo; done < "$T/split" | wc -l | tr -d ' ')
+  [ "$n" = 0 ] || warn "kept $(pl "$n" "partly copied file") (NAME.adbcp-part) so the copy can resume; run the same copy again to finish $([ "$n" = 1 ] && echo it || echo them)"
+}
+
+# Files sent in parts that an earlier run left unfinished: their record names the same
+# source, size, time and part size, and the part file is still at the destination and
+# covers every recorded part. Writes "DEST<TAB>PART<TAB>PARTS<TAB>BYTES" per part that is
+# already there to $T/resume and removes those parts from $T/big.
+resume_scan() {
+  local dir size mtime src dst rec
+  : > "$T/resume"; : > "$T/cand"
+  find "$(cache_dir)/parts" -type f -mtime +30 -exec rm -f {} + 2>/dev/null   # forgotten records
   [ -s "$T/split" ] || return 0
-  while IFS=$'\t' read -r size mtime src dst; do cmd="$cmd rm -f $(rq "$dst.adbcp-part");"; done < "$T/split"
-  "$ADB" shell "$cmd" </dev/null >/dev/null 2>&1
+  dir=$([ $PULL = 1 ] && echo pull || echo push)
+  while IFS=$'\t' read -r size mtime src dst; do
+    rec=$(part_record $dir "$dst")
+    has_progress "$rec" && [ "$(head -1 "$rec")" = "$(part_header "$src" "$size" "$mtime")" ] &&
+      printf '%s\t%s\n' "$dst" "$rec" >> "$T/cand"
+  done < "$T/split"
+  [ -s "$T/cand" ] || return 0
+  if [ $PULL = 1 ]; then
+    cut -f1 "$T/cand" | sed 's/$/.adbcp-part/' | tr '\n' '\0' | xargs -0 "${LSTAT_SN[@]}" > "$T/cand.size" 2>/dev/null
+  else
+    cut -f1 "$T/cand" | sed 's/$/.adbcp-part/' | tr '\n' '\0' |
+      "$ADB" shell -T 'xargs -0 stat -c "%s %n" 2>/dev/null' > "$T/cand.size" 2>/dev/null
+  fi
+  BS=$BS awk -F'\t' -v resume="$T/resume" -v rest="$T/big.rest" '
+    FILENAME == ARGV[1] { p = $0; sub(/^[0-9]+ /, "", p); sub(/\.adbcp-part$/, "", p); psize[p] = $0 + 0; next }
+    FILENAME == ARGV[2] { if (!($1 in psize)) next
+      first = 1; while ((getline l < $2) > 0) { if (!first) have[$1, l + 0] = 1; first = 0 }; close($2); cand[$1] = 1; next }
+    { line[++n] = $0; k = $2; sub(/^chunk/, "", k); sub(/\/.*/, "", k); part[n] = k + 0
+      if ($2 ~ /^chunk/ && ($5 in cand) && have[$5, part[n]]) {
+        end = $6 * ENVIRON["BS"] + $1; if (end > psize[$5]) bad[$5] = 1 } }
+    END {
+      for (i = 1; i <= n; i++) {
+        split(line[i], f, "\t")
+        if (f[2] ~ /^chunk/ && (f[5] in cand) && !(f[5] in bad) && have[f[5], part[i]]) {
+          np = f[2]; sub(/.*\//, "", np); print f[5] "\t" part[i] "\t" np "\t" f[1] > resume
+        } else print line[i] > rest
+      } }' "$T/cand.size" "$T/cand" "$T/big"
+  if [ -s "$T/resume" ]; then mv "$T/big.rest" "$T/big"; else rm -f "$T/big.rest"; fi
+}
+is_resumed() { [ -s "$T/resume" ] && grep -Fxq -- "$1" "$T/resume.files"; }
+new_record() {   # push|pull SRC SIZE MTIME DEST
+  local rec; rec=$(part_record "$1" "$5")
+  mkdir -p "${rec%/*}" && { part_header "$2" "$3" "$4"; echo; } > "$rec" ||
+    warn "cannot write $rec; this copy cannot resume"
 }
 
 ADB=${ADB:-}

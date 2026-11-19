@@ -98,7 +98,9 @@ The engine uses these methods. Each one was measured on a real phone.
 
 1. **Several files at the same time.** One adb transfer waits for the phone to confirm each piece before it sends the next piece. Several parallel transfers keep the cable busy.
 2. **Small files in groups, next to large files.** The phone needs about 5–10 ms to create each file in shared storage. The file size does not change this. Thus the engine sends small files in groups of 200, on their own transfers. These transfers run at the same time as the large files. The large files hide the cost of the small files.
-3. **Large files in parts.** The engine can split very large files that do not compress, such as video and archives. It sends the parts at the same time and writes them directly into place.
+3. **Large files in parts.** The engine splits large files into parts of 128 MiB. It sends the parts at the same time and writes them directly into place. It splits these files:
+   - Files of 256 MiB or more that do not compress. The extension tells for video, photos, music, and archives. For other files, the engine compresses a 3 MiB sample (three slices of 1 MiB) with gzip. If the sample does not get at least 3% smaller, the file counts as incompressible. Encrypted game packages are an example.
+   - Files of 4 GiB or more, also when they compress. Parts cannot use adb's compression, but they make the file resumable (see 6.3). On the test phone, compressible game files in parts took 32–34 s against 26 s with zstd. Thus smaller compressible files keep zstd.
 4. **Compression only where it helps.** Video, photos, music, and archives are already compressed. The engine sends them as they are. It compresses other data in transit when a quick test shows a gain.
 5. **Measured settings.** The engine measures the number of parallel transfers for each phone, cable, and destination (see section 5).
 6. **Fast bulk checks.** Resume and verify check all files in one pass. They do not send one request for each file.
@@ -115,16 +117,42 @@ The same methods apply to copies from the phone. In that direction:
 - **Retries.** The engine tries each file or group up to three times. Then it reports the file as failed.
 - **Free space.** The engine checks the free space before it starts.
 - **Names that the phone does not allow.** The engine reports these names before the copy starts. With `--fix-names`, it copies these files and replaces each character that is not allowed with `_`. If the new name is already in use, the engine adds `_2`, `_3`, and so on before the extension.
-- **Cancel and interruption.** The engine stops all transfers. It removes temporary files from the destination, on the phone or on the Mac.
+- **Cancel and interruption.** The engine stops all transfers. It keeps the part files of files sent in parts that have at least one part recorded (see 6.3). It removes all other temporary files from the destination, on the phone or on the Mac.
+- **Part checks.** For a copy to the phone, the phone's `dd` must report the exact byte count of each part. Otherwise the part counts as failed.
 - **Verification.** The engine calculates SHA-1 checksums on the Mac and on the phone separately, then compares them.
 
 ### 6.3 Resuming
 
-"Skip existing" (`--skip-existing`) leaves out every file that exists at the destination
-with the same size. This applies in both directions. An interrupted file is absent or has
-the wrong size. Thus the engine copies it again.
+The engine continues a stopped copy at two levels.
+
+**Inside large files.** This applies to files sent in parts (see 6.1).
+
+1. Before the copy, the engine writes a record for each such file in `~/Library/Caches/adbcp/parts/`. The first line names the source: path, size, modification time, and part size.
+2. When a part arrives, the engine adds the part number to the record.
+3. When the file is complete, the engine renames `NAME.adbcp-part` to `NAME` and deletes the record.
+4. If the copy stops, the part file and the record stay. This applies to cancel, failed parts, a cut cable, and a crash.
+5. The next run of the same copy reads the record. It sends only the parts that are not recorded.
+
+The engine starts the file again in these cases:
+
+- The first line of the record does not match the source or the part size.
+- The part file is missing, or it is shorter than the end of the last recorded part.
+
+The engine finds the record from the direction, the phone's serial number, and the
+destination path. It deletes records that are older than 30 days. A file is never
+visible under its real name until it is complete.
+
+**Whole files.** "Skip existing" (`--skip-existing`) leaves out every file that exists
+at the destination with the same size. This applies in both directions. An interrupted
+file is absent or has the wrong size. Thus the engine copies it again, or resumes it if
+it went in parts.
 
 If you also turn on "Verify", the engine checks every file, including the skipped files.
+
+Tested on the S23 Ultra with a 3 GiB file, in both directions: cancel after 8 s, a hard
+kill (no clean-up), and part uploads that fail like a cut cable. Each next run showed
+"Resuming", sent only the missing parts, and passed verification. After a change of the
+source file, the next run started over.
 
 ### 6.4 Getting adb
 
@@ -181,6 +209,7 @@ during the copy.
 | `warning` | Something that the user must know. The copy continues. | `message` |
 | `start` | The engine found the files. It is about to plan the copy. | `version`, `serial`, `model`, `connection` (`usb` or `network`), `link_mbps` (or null), `direction` (`to_phone` or `from_phone`), `destination`, `files`, `bytes` |
 | `skip` | Files that the engine leaves out because they already exist | `files`, `bytes` |
+| `resume` | Files sent in parts that an earlier run left unfinished. The engine sends only their missing parts. `bytes_total` in `progress` does not include `bytes`. | `files`, `bytes` (already at the destination) |
 | `calibration` | The measurement is complete | `large_mib_per_second` and `small_files_per_second` (each by number of transfers, for example `{"2":158,"4":218,"8":294}`), `cores`, `streams`, `small_streams`, `hash_workers` |
 | `compression_test` | The compression test is complete | `mib_per_second` (by method), `choice` |
 | `plan` | The engine selected its settings | `tuning`, `compression`, `large_files`, `large_jobs`, `streams`, `split_files`, `small_files`, `small_jobs`, `small_streams`, `dry_run` |
@@ -305,8 +334,8 @@ same time and joins them into the complete file at the destination.
 
 **Process group.** A set of programs that the system can stop together with one signal.
 
-**Resume.** Continuing an interrupted copy. The engine skips the files that already
-arrived (`--skip-existing`).
+**Resume.** Continuing an interrupted copy. The engine sends only the missing parts of
+large files, and skips the files that already arrived (`--skip-existing`).
 
 **Shared storage.** The main user storage on the phone, shown as `/sdcard` (also
 `/storage/emulated/0`). It holds Download, DCIM, Music, and similar folders. Android

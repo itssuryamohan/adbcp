@@ -18,7 +18,7 @@ each piece. adbcp uses the same adb, but it:
 - **Tunes itself.** It measures each phone, cable, and destination one time (about 10 seconds).
 - **Works in both directions**: Mac to phone, and phone to Mac (`--pull`).
 - **Checks its work.** `--verify` compares SHA-1 checksums on both sides.
-- **Continues a stopped copy.** `--skip-existing` skips files that already arrived.
+- **Continues a stopped copy.** Large files continue from the last part that arrived. `--skip-existing` skips files that already arrived.
 - **Does not leave half-written files.** See the note on unplugging in [Before you use it](#before-you-use-it).
 
 ### Measured speed
@@ -90,7 +90,7 @@ These are not bugs, but they can surprise you:
 - **Shared storage (`/sdcard`) refuses some characters in names**: `" * : < > ? | \`. adbcp reports these files. `--fix-names` copies them with `_` instead.
 - **Measuring writes test files** into a hidden `.adbcp-probe…` folder in the destination. adbcp deletes them afterwards.
 - **`--burst` and `--libusb` restart the adb server.** This disconnects other adb tools, such as Android Studio, for a moment.
-- **Unplugging the cable stops the copy.** Finished files stay. A large file that was sent in parts can leave a hidden `….adbcp-part` file. The next copy of the same file replaces it. Otherwise, delete it by hand.
+- **A stopped copy keeps its partly copied large files.** Cancel, a cut cable, or a crash leaves `NAME.adbcp-part` files at the destination. Run the same copy again to finish them. If you do not want to continue, delete these files by hand.
 
 ## Documentation
 

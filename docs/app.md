@@ -54,7 +54,7 @@ The transfer bar at the bottom shows the progress, speed, and time left.
 
 - **Problems** lists files that failed, with the reason.
 - **Details** shows all messages from the engine.
-- **Cancel** stops the copy and clears the queue. The app removes files that it did not finish.
+- **Cancel** stops the copy and clears the queue. Large files that the engine sends in parts stay as `NAME.adbcp-part`. Copy the same items again to continue them. The app removes other unfinished files.
 
 After a copy:
 
