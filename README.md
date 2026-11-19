@@ -1,178 +1,116 @@
 # adbcp
 
-Fast file copying between a Mac and an Android phone over a USB cable: a command-line
-tool, plus a small desktop app.
+adbcp copies files between a Mac and an Android phone over a USB cable. It is fast.
+It has a command-line tool and a small desktop app.
 
-> **Use at your own risk.** This is a personal project, provided as is, without any
+> **Use at your own risk.** This is a personal project. It comes as is, without
 > warranty. The author is not responsible for lost or damaged files, or for damaged or
-> unusable ("bricked") devices. Read the [disclaimer](#disclaimer) before using it.
+> unusable ("bricked") devices. Read the [disclaimer](#disclaimer) before you use it.
 
 ## What it does
 
-The standard `adb push` and `adb pull` send one file at a time and wait for the phone to
-confirm each piece. adbcp uses the same adb underneath, but:
+`adb push` and `adb pull` send one file at a time. They wait for the phone to confirm
+each piece. adbcp uses the same adb, but it:
 
-- **Sends several files at once**, and splits very large files into parts sent in parallel.
-- **Batches small files**: up to 200 per transfer, alongside the large ones, so that the
-  phone's per-file overhead hides behind the big transfers.
-- **Compresses only what compresses**: video, photos and archives are sent as they are.
-- **Tunes itself**: measures each phone, cable and destination once (about 10 seconds)
-  and remembers the best settings.
-- **Works in both directions**: computer to phone, and phone to computer (`--pull`).
-- **Checks its work** (`--verify` compares SHA-1 checksums on both sides) and
-  **resumes** interrupted copies (`--skip-existing`).
-- **Avoids half-written files**: large files are assembled under a temporary name, and
-  partial files are removed when a copy fails or is cancelled (but see the note on
-  unplugging below).
-- **Shows real progress**, including inside large files, and reports problems in plain words.
+- **Sends several files at the same time.** It also splits very large files into parts and sends the parts at the same time.
+- **Sends small files in groups** of up to 200, next to the large files.
+- **Compresses only data that gets smaller.** It sends video, photos, and archives as they are.
+- **Tunes itself.** It measures each phone, cable, and destination one time (about 10 seconds).
+- **Works in both directions**: Mac to phone, and phone to Mac (`--pull`).
+- **Checks its work.** `--verify` compares SHA-1 checksums on both sides.
+- **Continues a stopped copy.** `--skip-existing` skips files that already arrived.
+- **Does not leave half-written files.** See the note on unplugging in [Before you use it](#before-you-use-it).
 
 ### Measured speed
 
-On a Galaxy S23 Ultra over USB 3 (5 Gb/s), copying 12.6 GB of game data in 1,881 files:
+Galaxy S23 Ultra over USB 3 (5 Gb/s), 12.6 GB of game data in 1,881 files:
 
 | Direction | adbcp | Plain `adb` |
 |---|---|---|
-| Computer to phone | 32 s (about 400 MiB/s) | not measured for this folder |
-| Phone to computer | 32 s | 68–76 s (`adb pull`) |
+| Mac to phone | 32 s (about 400 MiB/s) | not measured for this folder |
+| Phone to Mac | 32 s | 68–76 s (`adb pull`) |
 
-On a USB 2.0 cable the same phone reached about 34 MB/s, and more on data that
-compresses well. These numbers come from one phone; yours will differ.
+Over a USB 2.0 cable, the same phone reached about 34 MB/s. These numbers come from one
+phone. Your results can be different.
 
-## Requirements
+## Quick start
 
-- **A Mac** (Apple Silicon or Intel) with a current macOS. The tool is a bash script that
-  also runs on the bash 3.2 shipped with macOS. It was written with Linux in mind but has
-  only been tested on macOS.
-- **An Android phone with USB debugging turned on** (see below).
-- **A USB data cable.** A USB 3 cable in a USB 3 port is 5–10 times faster than USB 2.0;
-  adbcp warns when the connection is slow.
-- **No adb installation needed.** adbcp uses an adb already on your Mac (PATH, Homebrew,
-  Android Studio). If there is none, the command-line tool downloads Google's official
-  platform-tools once and checks Google's signature; the app asks first.
+1. Turn on USB debugging on the phone. See [Install](docs/install.md#turn-on-usb-debugging).
+2. Connect the phone with a USB data cable.
+3. Get adbcp:
 
-### Turning on USB debugging
+   ```bash
+   git clone https://github.com/itssuryamohan/adbcp.git
+   cd adbcp
+   ```
 
-1. On the phone, open **Settings › About phone** and tap **Build number** seven times.
-2. Open **Settings › Developer options** and turn on **USB debugging**.
-3. Connect the cable and accept **Allow USB debugging** on the phone.
+4. Copy files:
 
-USB debugging lets a computer you have allowed control the phone. Turn it off again when
-you no longer need it.
+   ```bash
+   # Mac to phone
+   ./adbcp --verify ~/Movies/trip.mp4 /sdcard/Movies/
 
-## Command-line use
+   # Phone to Mac
+   ./adbcp --pull --verify /sdcard/DCIM/Camera ~/Pictures/phone/
 
-```bash
-git clone https://github.com/<your-account>/adbcp.git && cd adbcp
-chmod +x adbcp
+   # Continue a copy that stopped
+   ./adbcp --skip-existing ~/Documents/Games/MyGame /sdcard/Games/
+   ```
 
-# Computer to phone
-./adbcp ~/Movies/trip.mp4 /sdcard/Movies/
-./adbcp --verify ~/Documents/Games/MyGame /sdcard/Games/
+adbcp uses an adb that is already on the Mac. If there is none, it downloads Google's
+adb one time and checks Google's signature. See [Get adb](docs/install.md#get-adb).
 
-# Phone to computer
-./adbcp --pull --verify /sdcard/DCIM/Camera ~/Pictures/phone/
-
-# Continue an interrupted copy
-./adbcp --skip-existing ~/Documents/Games/MyGame /sdcard/Games/
-
-# See what would happen, without copying
-./adbcp --dry-run ~/Documents/Games/MyGame /sdcard/Games/
-
-./adbcp --help
-```
-
-Other useful options: `--measure PATH` measures the phone now, `--show-profile PATH`
-shows the saved measurements, `--fix-names` replaces characters the phone does not allow
-in file names, and `--json` prints machine-readable progress events.
+All options are in [Command-line tool](docs/cli.md).
 
 ## Desktop app
 
-A two-pane file manager built on the same engine with [Tauri 2](https://tauri.app):
-this Mac on the left, the phone on the right. Select items and copy them across, drag
-them from one pane to the other, or drop files from Finder onto the phone pane. Both
-panes can make folders, rename and delete (on the Mac to the Trash; on the phone
-permanently, after asking). Copies queue up, and a transfer bar shows progress, speed,
-time left and any problems. Settings, measurements and the last folders are remembered.
+The app shows two file lists side by side: this Mac on the left, the phone on the right.
 
-### Download
+- Select items and click a copy button, or drag them to the other pane.
+- Drop files from Finder onto the phone pane.
+- Make folders, rename, and delete on both sides.
+- See the progress, speed, time left, and problems in the transfer bar.
 
-GitHub builds the app for each version tag on `main`, and when someone starts the build
-by hand (see `.github/workflows/build.yml`). The app runs on Apple Silicon and Intel Macs.
+Download the app from the **Releases** page. It runs on Apple Silicon and Intel Macs.
+Apple did not notarize it, so you must allow it one time. See
+[Open the app the first time](docs/install.md#open-the-app-the-first-time).
 
-- **Releases:** each tagged version has a zip on the repository's Releases page.
-- **Builds started by hand:** open the Actions tab, pick a successful "Build" run, and
-  download the zip under Artifacts. You need to be signed in to GitHub for this.
+The app is about 6.6 MB. It does not include Google's adb. If no adb is on the Mac, the
+app asks before it downloads it.
 
-The app is not signed by Apple, so macOS blocks it the first time:
-
-1. Unzip it and move `adbcp.app` to Applications.
-2. Open it. macOS says it cannot check the app. Press **Done**.
-3. Open **System Settings > Privacy & Security** and press **Open Anyway** next to adbcp.
-
-To skip these steps, run `xattr -dr com.apple.quarantine /Applications/adbcp.app`.
-
-### Build it yourself
-
-```bash
-# Once: Rust (https://rustup.rs) and Node.js are needed
-cd app
-npm install
-npm run build                    # needs ~/.cargo/bin on your PATH
-open src-tauri/target/release/bundle/macos/adbcp.app
-```
-
-For a build that also runs on Intel Macs, run `rustup target add x86_64-apple-darwin`
-once, then `npm run build -- --target universal-apple-darwin`.
-
-The app is about 3 MB (6.6 MB for the Apple Silicon and Intel build). It does not include Google's adb: it uses the one already on
-your Mac (from your PATH, Homebrew or Android Studio), and otherwise asks before
-downloading Google's official package (about 16 MB, once, signature-checked). It is
-not signed or notarized by Apple. The build gives it an ad-hoc signature only.
+To build the app yourself, see [Development](docs/development.md#build-the-app).
 
 ## Before you use it
 
 These are not bugs, but they can surprise you:
 
-- **The command-line tool overwrites files with the same name without asking**, in both
-  directions. The desktop app asks first.
-- **Deleting on the phone is permanent**: adb has no trash. The app always asks first and
-  refuses to delete storage roots and standard folders such as DCIM or Download.
-- **"Skip existing" only compares file sizes.** Add `--verify` to compare the contents.
-- **The phone's shared storage (`/sdcard`) refuses some characters in names**
-  (`" * : < > ? | \`). Such files are reported, or renamed with `--fix-names`.
-- **Measuring writes test files** into a hidden `.adbcp-probe…` folder in the destination
-  and deletes them afterwards.
-- **`--burst` and `--libusb` restart the adb server**, which briefly disconnects other adb
-  tools such as Android Studio.
-- **Unplugging the cable during a copy** stops it. Files that finished copying stay. A
-  large file that was being copied in parts can leave a hidden `….adbcp-part` file on
-  the phone; running the same copy again normally replaces it, otherwise delete it by hand.
+- **The command-line tool replaces files with the same name. It does not ask.** This is true in both directions. The app asks first.
+- **Deleting on the phone is permanent.** adb has no trash. The app always asks first. It does not delete storage roots or standard folders, such as DCIM or Download.
+- **"Skip existing" compares only file sizes.** Add `--verify` to compare the contents.
+- **Shared storage (`/sdcard`) refuses some characters in names**: `" * : < > ? | \`. adbcp reports these files. `--fix-names` copies them with `_` instead.
+- **Measuring writes test files** into a hidden `.adbcp-probe…` folder in the destination. adbcp deletes them afterwards.
+- **`--burst` and `--libusb` restart the adb server.** This disconnects other adb tools, such as Android Studio, for a moment.
+- **Unplugging the cable stops the copy.** Finished files stay. A large file that was sent in parts can leave a hidden `….adbcp-part` file. The next copy of the same file replaces it. Otherwise, delete it by hand.
 
 ## Documentation
 
-- [SPEC.md](SPEC.md): how the copy engine works, its measured performance, and the
-  events the app reads.
-- [app/SPEC.md](app/SPEC.md): the desktop app: window, settings, building and testing.
-
-## Project layout
-
-```
-adbcp            the copy engine (one bash script)
-.github/         GitHub workflow that builds the app
-SPEC.md          engine specification
-app/             desktop app (Tauri 2: Rust + HTML/CSS/JavaScript)
-  SPEC.md        app specification
-  src/           the window
-  src-tauri/     the Rust side, app configuration and icons
-```
+| Document | Contents |
+|---|---|
+| [Install](docs/install.md) | USB debugging, the tool, the app, and adb |
+| [Command-line tool](docs/cli.md) | Common tasks and all options |
+| [Desktop app](docs/app.md) | How to use the window |
+| [Troubleshooting](docs/troubleshooting.md) | Error messages and slow copies |
+| [Development](docs/development.md) | Build, test, and release |
+| [Engine specification](docs/engine-spec.md) | How the engine works, and its JSON events |
+| [App specification](docs/app-spec.md) | The app design and tests |
 
 ## Third-party software
 
-- **adb** (Android platform-tools) is made by Google and covered by Google's own license.
-  It is not included in this repository or in the app; adbcp downloads it from Google
-  when needed (the app asks first).
-- **Tauri** and the other Rust and npm packages used by the app are covered by their own
-  licenses, listed in `app/src-tauri/Cargo.lock` and `app/package-lock.json`.
+- **adb** (Android platform-tools) comes from Google, under Google's license. This
+  repository and the app do not include it. adbcp downloads it from Google when needed.
+  The app asks first.
+- **Tauri** and the other Rust and npm packages have their own licenses. The lists are
+  in `app/src-tauri/Cargo.lock` and `app/package-lock.json`.
 
 ## Disclaimer
 

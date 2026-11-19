@@ -1,4 +1,4 @@
-// adbcp desktop app: a window around the adbcp copy engine (see ../../SPEC.md).
+// adbcp desktop app: a window around the adbcp copy engine (see ../../docs/app-spec.md).
 //
 // The engine is the bash script bundled under Resources/engine. Google's adb is not
 // bundled: the engine finds an installed one, or the window asks before downloading it. This side starts it

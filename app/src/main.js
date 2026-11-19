@@ -1,6 +1,6 @@
 // adbcp window: two file panes (this Mac, the phone) and a transfer bar. Copies are run
 // by the adbcp engine through the Rust side; its JSON events ("start", "plan",
-// "progress", ...) drive the transfer bar. See ../SPEC.md.
+// "progress", ...) drive the transfer bar. See ../../docs/app-spec.md.
 'use strict';
 
 const { invoke } = window.__TAURI__.core;

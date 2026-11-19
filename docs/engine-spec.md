@@ -1,61 +1,66 @@
 # adbcp: Fast File Copy to Android Phones
 
-High-level specification
+Engine specification
 
 | | |
 |---|---|
-| Status | Copy engine: working in both directions (command-line tool `adbcp`). Desktop app: first version built; specified separately in [app/SPEC.md](app/SPEC.md). |
-| Platform | macOS (Apple Silicon and Intel). Linux mostly works for the engine. Windows is not supported. |
-| Last updated | 2026-11-05 |
+| Status | The copy engine (command-line tool `adbcp`) works in both directions. The desktop app is at version 0.3.0. See [app-spec.md](app-spec.md). |
+| Platform | macOS on Apple Silicon and Intel. The engine mostly works on Linux. Windows is not supported. |
+| Last updated | 2026-11-19 |
 
-Words shown in *italics* the first time are explained in the [Glossary](#glossary) at the end.
+The [Glossary](#glossary) at the end explains the terms in *italics*.
 
 ---
 
 ## 1. Purpose
 
-Copying large amounts of data between a Mac and an Android phone over a USB cable is
-slow with the standard tools. A 60 GB game folder with 15,000 files can take many minutes,
-gives little feedback, and leaves half-copied files behind if something goes wrong.
+Standard tools copy data slowly between a Mac and an Android phone over USB. A 60 GB
+game folder with 15,000 files can take many minutes. The standard tools show little
+progress. They can also leave half-copied files when something goes wrong.
 
-adbcp copies files and folders to a connected phone, or from the phone back to the Mac,
-as fast as the cable and phone allow, shows clear progress, can check that every file arrived intact, and can resume
-an interrupted copy. It has two parts:
+adbcp copies files and folders between the Mac and a connected phone, in both
+directions. It does these things:
 
-- **The copy engine** (`adbcp`): a command-line tool that does the actual work. It exists today.
-- **The desktop app**: a window for choosing files, a destination, and options, with a
-  progress bar. It runs the engine behind the scenes and has its own specification:
-  [app/SPEC.md](app/SPEC.md).
+- It copies as fast as the cable and the phone allow.
+- It shows clear progress.
+- It can check that every file arrived without changes.
+- It can continue an interrupted copy.
 
-This document covers the engine and the interface the app uses to drive it.
+adbcp has two parts:
+
+- **The copy engine** (`adbcp`) is a command-line tool. It does the copying.
+- **The desktop app** is a two-pane window for the Mac and the phone. It runs the engine
+  and shows its progress. [app-spec.md](app-spec.md) specifies it.
+
+This document specifies the engine and the interface that the app uses to control it.
 
 ## 2. Goals and non-goals
 
 **Goals**
 
-1. Copy large files and large folders to a phone, and from a phone, as fast as the hardware allows.
-2. Work out good settings automatically for each phone, cable and destination, with no tuning needed by the user.
-3. Show honest progress: amount copied, speed, and time left, including while big files are still in transit.
-4. Never leave broken files at the destination. A file is either fully copied or absent.
-5. Make it easy to resume an interrupted copy and to check a finished copy.
-6. Need nothing pre-installed beyond macOS itself.
+1. Copy large files and large folders to and from a phone as fast as the hardware allows.
+2. Find good settings for each phone, cable, and destination. The user does not tune anything.
+3. Show correct progress: amount copied, speed, and time left. This includes large files that are still in transit.
+4. Never leave broken files at the destination. A file is either complete or absent.
+5. Make it easy to continue an interrupted copy and to check a finished copy.
+6. Need nothing except macOS and Google's adb. The engine can download adb.
 
-**Non-goals (for the first version)**
+**Non-goals (first version)**
 
-- Keeping two folders in sync (deleting files on the phone that were removed on the computer).
-- Copying to several phones at once.
-- Windows support.
-- Setting up wireless (Wi-Fi) connections to the phone.
+- Keep two folders in sync. The engine does not delete phone files that were removed on the Mac.
+- Copy to several phones at the same time.
+- Support Windows.
+- Set up wireless (Wi-Fi) connections to the phone.
 
 ## 3. Typical use
 
 | Situation | What the user does | What happens |
 |---|---|---|
-| Copy a big folder (for example a game) | Choose the folder, choose a destination such as `/sdcard/Games/`, press Start | The first time with this phone, a short measurement runs (about 10 seconds), then the copy |
-| The cable came loose halfway | Run the same copy again with "Skip files already on the phone" on | Only missing or incomplete files are copied |
-| Make sure nothing is corrupted | Turn on "Verify after copying" | Every file is checked on both sides and any differences are listed |
-| The copy is slower than expected | Read the warning shown at the start | If the phone is on a slow (USB 2.0) cable or port, the app says so |
-| Back up photos from the phone | Switch the direction to "Phone to computer", choose `/sdcard/DCIM/Camera` and a folder on the Mac | The same fast, checked copy, in the other direction |
+| Copy a big folder, for example a game | Choose the folder and a destination such as `/sdcard/Games/`. Start the copy. | With a new phone, a short measurement runs first (about 10 seconds). Then the copy starts. |
+| The cable came loose during the copy | Run the same copy again with "Skip existing" on. | The engine copies only missing or incomplete files. |
+| Make sure that no file is corrupted | Turn on "Verify after copying". | The engine checks every file on both sides and lists all differences. |
+| The copy is slower than expected | Read the warning at the start. | If the phone uses a slow (USB 2.0) cable or port, the engine says so. |
+| Back up photos from the phone | Copy `/sdcard/DCIM/Camera` to a folder on the Mac. | The engine makes the same fast, checked copy in the other direction. |
 
 ## 4. How it works
 
@@ -67,101 +72,83 @@ This document covers the engine and the interface the app uses to drive it.
                      events
 ```
 
-The app turns the user's choices into engine options, starts the engine, and reads the
-progress *events* it reports. The engine talks to the phone through *adb*, Google's
-standard tool for this, which it brings along or downloads by itself.
+1. The app changes the user's choices into engine options.
+2. The app starts the engine.
+3. The engine talks to the phone through *adb*, Google's standard tool. It uses an installed adb or downloads one (see 6.4).
+4. The engine reports progress as *events*. The app reads them.
 
 ## 5. Measuring (automatic settings)
 
-The best number of parallel transfers depends on the phone, the cable, and where the
-files go on the phone. The engine measures this itself:
+The best number of parallel transfers depends on the phone, the cable, and the
+destination on the phone. The engine measures this itself.
 
-- **Only for copies to the phone.** Copies from the phone use fixed settings that were
-  measured once (8 parallel transfers, small files in groups on 4), because reading from
-  a phone behaves more evenly than writing to it.
-- **When:** the first time a large copy (2 GB or more, or 1,000 files or more) goes to a
-  phone over a given connection and to a given kind of destination. Smaller copies use
-  built-in defaults until then. `--recalibrate` (in the app: "Measure this phone again")
-  repeats it at any time.
-- **How long:** about 10 seconds, reported as a `calibration` event.
-- **What:** test copies of medium-size files with 2, 4 and 8 parallel transfers; test
-  copies of many tiny files; and the number of processor cores in the phone.
-- **Saved:** the results are kept on the computer (`~/Library/Caches/adbcp/profiles`)
-  and reused for later copies.
-- **Compression** depends on the data, not the phone, so for large copies a short
-  test with a sample of the data runs each time (about 2 seconds).
+- **Direction:** the engine measures only for copies to the phone. Reading from a phone is more even than writing to it. Thus copies from the phone use fixed values: 8 parallel transfers, and groups of small files on 4.
+- **When:** the engine measures the first time that a large copy goes to a phone. A large copy has 2 GB or more, or 1,000 files or more. The engine measures again for each new connection type and each new kind of destination. Smaller copies use built-in values until a measurement exists.
+- **On request:** `--recalibrate` measures again before a copy. In the app, **Measure now** does this.
+- **Duration:** about 10 seconds. The engine reports the result in a `calibration` event.
+- **Tests:** the engine copies medium-size test files with 2, 4, and 8 parallel transfers. It copies many tiny test files. It also reads the number of processor cores in the phone.
+- **Storage:** the engine saves the results on the Mac in `~/Library/Caches/adbcp/profiles`. Later copies use them.
+- **Compression:** the best compression depends on the data, not on the phone. Thus the engine tests a sample of the data for each large copy (about 2 seconds).
 
 ## 6. The copy engine
 
 ### 6.1 Why it is fast
 
-In plain terms, the engine combines several techniques. Each one was measured on a real phone.
+The engine uses these methods. Each one was measured on a real phone.
 
-1. **Several files at once.** A single adb transfer waits for the phone to confirm each
-   piece before sending the next. Running several transfers in parallel keeps the cable busy.
-2. **Small files in groups, alongside large ones.** Creating a file in the phone's shared
-   storage takes the phone about 5–10 milliseconds no matter how small the file is.
-   Small files are therefore sent in groups of 200, on their own transfers, at the same
-   time as the large files. That way their cost hides behind the large files.
-3. **Large files in parts.** Very large files that do not compress well (video,
-   archives) can be sent as several parts at once, written straight into place.
-4. **Compression only where it helps.** Video, photos, music and archives are already
-   compressed and are sent as they are. Other data is compressed in transit when a quick
-   test shows it helps.
-5. **Measured settings.** The number of parallel transfers is measured per phone, cable
-   and destination (see section 5).
-6. **Quick bulk checks.** Resume and verify each check all files in one pass instead of
-   one request per file.
+1. **Several files at the same time.** One adb transfer waits for the phone to confirm each piece before it sends the next piece. Several parallel transfers keep the cable busy.
+2. **Small files in groups, next to large files.** The phone needs about 5–10 ms to create each file in shared storage. The file size does not change this. Thus the engine sends small files in groups of 200, on their own transfers. These transfers run at the same time as the large files. The large files hide the cost of the small files.
+3. **Large files in parts.** The engine can split very large files that do not compress, such as video and archives. It sends the parts at the same time and writes them directly into place.
+4. **Compression only where it helps.** Video, photos, music, and archives are already compressed. The engine sends them as they are. It compresses other data in transit when a quick test shows a gain.
+5. **Measured settings.** The engine measures the number of parallel transfers for each phone, cable, and destination (see section 5).
+6. **Fast bulk checks.** Resume and verify check all files in one pass. They do not send one request for each file.
 
-The same techniques apply when copying from the phone. There the phone compresses the
-data, the parts of a split file are read on the phone and written into place on the
-Mac, and the list of files on the phone is read in a single request.
+The same methods apply to copies from the phone. In that direction:
+
+- The phone compresses the data.
+- The engine reads the parts of a split file on the phone and writes them into place on the Mac.
+- The engine reads the list of files on the phone in one request.
 
 ### 6.2 Safety
 
-- **No half-written files.** Files sent in parts are assembled under a temporary name
-  and renamed only when complete. A whole file that fails part-way is removed. When
-  copying from the phone, every file is written under a temporary name and renamed
-  when complete.
-- **Retries.** Each file or group is retried up to three times before it counts as failed.
-- **Free space** is checked before starting.
-- **Names the phone does not allow** are reported before the copy starts instead of failing
-  later. With `--fix-names` they are copied with each disallowed character replaced by
-  `_`; a name that then clashes with another file gets `_2`, `_3`, … before its extension.
-- **Cancel and interruption** stop all transfers and remove temporary files from the
-  destination (the phone, or the Mac when copying from the phone).
-- **Verification** uses SHA-1 checksums computed separately on the computer and on the phone.
+- **No half-written files.** The engine writes a file sent in parts under a temporary name. It renames the file only when it is complete. When a whole-file transfer fails, the engine removes the partial file. For copies from the phone, the engine writes every file under a temporary name and renames it when it is complete.
+- **Retries.** The engine tries each file or group up to three times. Then it reports the file as failed.
+- **Free space.** The engine checks the free space before it starts.
+- **Names that the phone does not allow.** The engine reports these names before the copy starts. With `--fix-names`, it copies these files and replaces each character that is not allowed with `_`. If the new name is already in use, the engine adds `_2`, `_3`, and so on before the extension.
+- **Cancel and interruption.** The engine stops all transfers. It removes temporary files from the destination, on the phone or on the Mac.
+- **Verification.** The engine calculates SHA-1 checksums on the Mac and on the phone separately, then compares them.
 
 ### 6.3 Resuming
 
-Running the same copy with "Skip files already on the phone" leaves out every file that
-already exists at the destination with the same size (on the phone, or on the Mac when
-copying from the phone). A file whose copy was cut off is either
-absent or has the wrong size, so it is copied again. Adding "Verify" to a resumed copy
-checks every file, including the skipped ones.
+"Skip existing" (`--skip-existing`) leaves out every file that exists at the destination
+with the same size. This applies in both directions. An interrupted file is absent or has
+the wrong size. Thus the engine copies it again.
+
+If you also turn on "Verify", the engine checks every file, including the skipped files.
 
 ### 6.4 Getting adb
 
-The engine looks for adb in this order and uses the first one it finds:
+The engine looks for adb in this order. It uses the first adb that it finds.
 
-1. A specific adb chosen by the user (the `ADB` environment variable).
-2. A copy bundled next to the engine (made with `adbcp --bundle`, for personal use).
+1. The adb in the `ADB` environment variable.
+2. A copy next to the engine, in `platform-tools/`. `adbcp --bundle` makes this copy. Use it only for personal copies.
 3. adb on the `PATH`.
-4. The usual install places, which apps started from Finder cannot see through `PATH`:
-   Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`) and Android Studio's SDK
-   (`$ANDROID_HOME` or `~/Library/Android/sdk`).
-5. A copy it downloaded earlier (in `~/Library/Caches/adbcp`).
-6. Otherwise it downloads Google's official package once (about 16 MB) and checks that
-   Google's digital signature is valid before using it. With `ADBCP_NO_DOWNLOAD=1` it
-   stops with an error instead; the desktop app sets this and asks the user first.
+4. The usual install folders. Apps started from Finder do not see these folders through `PATH`.
+   - Homebrew: `/opt/homebrew/bin` and `/usr/local/bin`.
+   - Android Studio's SDK: `$ANDROID_HOME` or `~/Library/Android/sdk`.
+5. A copy that the engine downloaded before, in `~/Library/Caches/adbcp`.
+6. If none exists, the engine downloads Google's official package one time (about 16 MB). It checks Google's digital signature before it uses the package.
 
-`adbcp --adb-status` shows which adb would be used, without downloading anything, and
-`adbcp --get-adb` downloads Google's package on request.
+With `ADBCP_NO_DOWNLOAD=1`, step 6 stops with an error and downloads nothing. The desktop
+app always sets this variable. The app asks the user before it downloads adb.
+
+- `adbcp --adb-status` shows which adb the engine uses. It downloads nothing.
+- `adbcp --get-adb` downloads Google's package on request.
 
 ### 6.5 Measured performance
 
-Galaxy S23 Ultra over USB 3 (5 Gb/s), copying real game data to `/sdcard`. "Before"
-is the first version of the engine, which sent one file per request.
+Galaxy S23 Ultra over USB 3 (5 Gb/s), with real game data copied to `/sdcard`. "Before"
+is the first engine version, which sent one file for each request.
 
 | Task | Before | Now |
 |---|---|---|
@@ -172,43 +159,44 @@ is the first version of the engine, which sent one file per request.
 | Verify 12.6 GB | about 40 s | 23–29 s |
 | Copy 12.6 GB, 1,881 files **from** the phone | 68–76 s (standard `adb pull`) | 32 s |
 
-On a USB 2.0 cable the same phone reached about 34 MB/s without compression, and up to
-about 108 MB/s of effective speed on data that compresses well.
+On a USB 2.0 cable, the same phone reached about 34 MB/s without compression. With data
+that compresses well, the effective speed reached about 108 MB/s.
 
 ## 7. How the app talks to the engine
 
-The app starts the engine as a separate program with command-line options (listed by
-`adbcp --help`; the app's settings are mapped in [app/SPEC.md](app/SPEC.md#36-settings))
-and the `--json` option. With `--json`, the engine writes one *JSON* object per line to
-its standard output. Each object has an `event` field naming what happened. Warnings and
-errors are also written as readable text to the error output, which the app can keep as
-a log.
+The app starts the engine as a separate program.
+
+- The app gives command-line options. `adbcp --help` and [cli.md](cli.md) list them. [app-spec.md](app-spec.md#35-settings) maps the app settings to options.
+- The app also gives the `--json` option. With it, the engine writes one *JSON* object per line to its standard output.
+- Each object has an `event` field. This field names what happened.
+- The engine also writes warnings and errors as readable text to its error output. The app can keep this text as a log.
 
 ### 7.1 Events
 
-Events arrive roughly in this order. `progress` repeats about once a second during the copy.
+Events arrive approximately in this order. `progress` repeats about once each second
+during the copy.
 
 | Event | When | Fields |
 |---|---|---|
-| `warning` | Something the user should know, not fatal | `message` |
-| `start` | Files found, copy about to be planned | `version`, `serial`, `model`, `connection` (`usb` or `network`), `link_mbps` (or null), `direction` (`to_phone` or `from_phone`), `destination`, `files`, `bytes` |
-| `skip` | Files left out because they are already on the phone | `files`, `bytes` |
-| `calibration` | Measuring finished | `large_mib_per_second` and `small_files_per_second` (each by number of transfers, for example `{"2":158,"4":218,"8":294}`), `cores`, `streams`, `small_streams`, `hash_workers` |
-| `compression_test` | Compression test finished | `mib_per_second` (by method), `choice` |
-| `plan` | Settings decided | `tuning`, `compression`, `large_files`, `large_jobs`, `streams`, `split_files`, `small_files`, `small_jobs`, `small_streams`, `dry_run` |
-| `progress` | About every second while copying | `bytes_done`, `bytes_total`, `files_done`, `files_total`, `files_failed`, `bytes_per_second`, `seconds_left` (null until known), `seconds_elapsed` |
-| `file_failed` | A file could not be copied | `path` (where the copy should have gone), `reason` (`name_not_allowed`, `copy_failed` or `assemble_failed`), `error` |
-| `renamed` | With `--fix-names`: a file got a name the phone allows | `from`, `to` |
-| `done` | Copying finished | `files_copied`, `files_failed`, `bytes`, `seconds`, `bytes_per_second` |
-| `verify_start` | Verification starting | `files` |
-| `verify_problem` | A file failed verification | `problem` (`missing`: the copy is missing or unreadable; `unreadable`: the original cannot be read; `different`), `path` |
-| `verify_done` | Verification finished | `files`, `problems`, `seconds` |
-| `error` | The copy cannot continue (also sent when cancelled, with message `interrupted`) | `message` |
-| `device` | One per phone, from `adbcp --devices --json` | `serial`, `state` (`device` when ready, or `unauthorized`, `offline`, …), `model`, `connection`, `link_mbps` |
-| `entry` | One per file or folder, from `adbcp --ls PATH --json` | `name`, `path`, `type` (`dir`, `file` or `other`), `size`, `mtime` |
-| `op_done` | After `--mkdir`, `--rename` or `--delete` succeeded | `op`, `count` (paths given) |
-| `adb` | From `--adb-status` and after `--get-adb` | `found`, `path`, `source` (`environment`, `bundled`, `path`, `homebrew`, `android-sdk` or `downloaded`), `version` |
-| `profile` | From `--show-profile PATH` and after `--measure PATH` | `saved` (false: built-in defaults apply), `kind` (`media`, `appdir` or `data`), `date`, `connection`, `link_mbps`, `streams`, `small_streams`, `small_kib`, `hash_workers`, `cores`, `large_mib_per_second`, `small_files_per_second` |
+| `warning` | Something that the user must know. The copy continues. | `message` |
+| `start` | The engine found the files. It is about to plan the copy. | `version`, `serial`, `model`, `connection` (`usb` or `network`), `link_mbps` (or null), `direction` (`to_phone` or `from_phone`), `destination`, `files`, `bytes` |
+| `skip` | Files that the engine leaves out because they already exist | `files`, `bytes` |
+| `calibration` | The measurement is complete | `large_mib_per_second` and `small_files_per_second` (each by number of transfers, for example `{"2":158,"4":218,"8":294}`), `cores`, `streams`, `small_streams`, `hash_workers` |
+| `compression_test` | The compression test is complete | `mib_per_second` (by method), `choice` |
+| `plan` | The engine selected its settings | `tuning`, `compression`, `large_files`, `large_jobs`, `streams`, `split_files`, `small_files`, `small_jobs`, `small_streams`, `dry_run` |
+| `progress` | About each second during the copy | `bytes_done`, `bytes_total`, `files_done`, `files_total`, `files_failed`, `bytes_per_second`, `seconds_left` (null until known), `seconds_elapsed` |
+| `file_failed` | The engine could not copy a file | `path` (the destination path), `reason` (`name_not_allowed`, `copy_failed`, or `assemble_failed`), `error` |
+| `renamed` | With `--fix-names`: a file got a name that the phone allows | `from`, `to` |
+| `done` | The copy is complete | `files_copied`, `files_failed`, `bytes`, `seconds`, `bytes_per_second` |
+| `verify_start` | Verification starts | `files` |
+| `verify_problem` | A file failed verification | `problem` (`missing`: the copy is missing or cannot be read; `unreadable`: the original cannot be read; `different`), `path` |
+| `verify_done` | Verification is complete | `files`, `problems`, `seconds` |
+| `error` | The copy cannot continue. The engine also sends it on cancel, with the message `interrupted`. | `message` |
+| `device` | One for each phone, from `adbcp --devices --json` | `serial`, `state` (`device` when ready, or `unauthorized`, `offline`, …), `model`, `connection`, `link_mbps` |
+| `entry` | One for each file or folder, from `adbcp --ls PATH --json` | `name`, `path`, `type` (`dir`, `file`, or `other`), `size`, `mtime` |
+| `op_done` | `--mkdir`, `--rename`, or `--delete` was successful | `op`, `count` (number of paths given) |
+| `adb` | From `--adb-status`, and after `--get-adb` | `found`, `path`, `source` (`environment`, `bundled`, `path`, `homebrew`, `android-sdk`, or `downloaded`), `version` |
+| `profile` | From `--show-profile PATH`, and after `--measure PATH` | `saved` (false: built-in values apply), `kind` (`media`, `appdir`, or `data`), `date`, `connection`, `link_mbps`, `streams`, `small_streams`, `small_kib`, `hash_workers`, `cores`, `large_mib_per_second`, `small_files_per_second` |
 
 Example:
 
@@ -220,111 +208,117 @@ Example:
 
 | Code | Meaning |
 |---|---|
-| 0 | Everything copied (and verified, if requested) |
-| 1 | Some files failed, verification found problems, or a fatal error occurred |
-| 130 | Cancelled by the user |
+| 0 | All files copied. With verify, all files match. |
+| 1 | Some files failed, verification found problems, or an error stopped the copy. |
+| 130 | The user cancelled the copy. |
 
 ### 7.3 Cancelling
 
-To cancel, the app sends the engine a stop signal (the same as pressing Ctrl-C). The
-engine must be started in its own process group so it can stop all of its transfers
-and clean up. Tested: the engine stops in under a second, and no partly copied file
-or leftover process remains.
+To cancel, the app sends the engine a stop signal. This signal is the same as Ctrl-C.
+
+The app must start the engine in its own *process group*. Then the engine can stop all
+its transfers and clean up. In tests, the engine stopped in less than one second. No
+partial file and no process remained.
 
 ### 7.4 Helper commands
 
-- `adbcp --devices` lists connected phones with model and connection speed.
-- `adbcp -s SERIAL --ls PATH` lists one folder on the phone, for the app's phone browser.
-- `adbcp -s SERIAL --show-profile PATH` shows the saved measurements for that phone,
-  its connection and the kind of destination PATH is.
-- `adbcp -s SERIAL --measure PATH` measures now, without copying, and saves the result.
-- `adbcp -s SERIAL --mkdir PATH`, `--rename OLD NEW` and `--delete PATH...` make a folder,
-  rename, and delete on the phone, for the app's phone pane. Deleting is permanent (adb
-  has no trash). `--delete` refuses storage roots, system areas, the standard top-level
-  folders (such as DCIM, Download, Android), one-level paths and paths containing `..`.
+| Command | What it does |
+|---|---|
+| `adbcp --devices` | Lists the connected phones with model and connection speed. |
+| `adbcp -s SERIAL --ls PATH` | Lists one folder on the phone, for the app's phone pane. |
+| `adbcp -s SERIAL --show-profile PATH` | Shows the saved measurement for the phone, its connection, and the kind of destination PATH. |
+| `adbcp -s SERIAL --measure PATH` | Measures now, without a copy, and saves the result. |
+| `adbcp -s SERIAL --mkdir PATH` | Makes a folder on the phone. |
+| `adbcp -s SERIAL --rename OLD NEW` | Renames an item on the phone. It never replaces an item. |
+| `adbcp -s SERIAL --delete PATH...` | Deletes items on the phone permanently. adb has no trash. |
+
+`--delete` refuses these paths:
+
+- Storage roots and system areas.
+- Standard top-level folders, such as DCIM, Download, and Android.
+- Paths with only one level, such as `/sdcard`.
+- Paths that contain `..`.
 
 ## 8. Requirements
 
-- **Computer:** a Mac running a current version of macOS. The engine uses only tools
-  that come with macOS.
-- **Phone:** Android with *USB debugging* turned on, and this computer allowed when the
-  phone asks. Compression needs a recent phone (Android 11 or newer).
-- **Cable:** any USB data cable works; a USB 3 cable and port are much faster.
+- **Computer:** a Mac with a current version of macOS. The engine uses only tools that come with macOS, plus adb.
+- **Phone:** Android with *USB debugging* on. The user must allow this computer when the phone asks. Compression needs Android 11 or later.
+- **Cable:** any USB data cable works. A USB 3 cable and port are much faster.
 
 ## 9. Packaging and distribution
 
-- The app is a standard macOS application containing the engine
-  (see [app/SPEC.md](app/SPEC.md#5-building-and-testing)).
-- The app does not include Google's adb, because Google's license limits redistributing
-  it. It uses an adb already on the Mac, or asks the user before downloading Google's
-  package from Google (see 6.4). The app is about 3 MB.
-- An app shared with others must be signed and *notarized* by Apple, or macOS will refuse to open it.
+- The app is a standard macOS application. It contains the engine. See [development.md](development.md#build-the-app).
+- The app does not include Google's adb, because Google's license limits redistribution. The app uses an adb that is already on the Mac. If there is none, it asks the user, then downloads Google's package (see 6.4).
+- The app is about 3 MB for one architecture, and about 6.6 MB for Apple Silicon and Intel.
+- Apple has not signed or *notarized* the app. macOS blocks it the first time. The user must allow it one time. See [install.md](install.md#open-the-app-the-first-time).
+- GitHub builds the app for Apple Silicon and Intel on demand and for version tags on `main`. See [development.md](development.md#github-build).
 
 ## 10. Open questions
 
-1. Measurements so far come from one phone (Galaxy S23 Ultra). Other phones, USB 2.0
-   cables and Wi-Fi connections still need testing.
+1. All measurements come from one phone (Galaxy S23 Ultra). Other phones, USB 2.0 cables, and Wi-Fi connections need tests.
 
-Questions about the app are listed in [app/SPEC.md](app/SPEC.md#7-open-questions).
+[app-spec.md](app-spec.md#7-decisions-and-open-questions) lists the questions about the app.
 
 ---
 
 ## Glossary
 
-**adb (Android Debug Bridge).** Google's official tool for talking to an Android phone
-from a computer. It is part of Google's "platform-tools" package.
+**adb (Android Debug Bridge).** Google's official tool that connects a computer to an
+Android phone. It is part of Google's "platform-tools" package.
 
 **App-specific folder.** The folders `Android/data` and `Android/obb` in the phone's
-storage, which belong to individual apps. Copying many small files there is much faster
-than into shared storage (measured: about 10 times faster).
+storage. Each subfolder belongs to one app. Copying many small files there is about 10
+times faster than copying into shared storage.
 
-**Checksum (SHA-1).** A short code computed from a file's contents. If the codes for the
-original and the copy match, the copy is identical. SHA-1 is the method used here.
+**Checksum (SHA-1).** A short code calculated from the contents of a file. If the codes of
+the original and the copy are the same, the files are the same. adbcp uses the SHA-1 method.
 
-**Compression (zstd, lz4).** Making data smaller while it travels, then restoring it on
-the phone. zstd and lz4 are two common methods: zstd usually shrinks more, lz4 uses less
-processing power. Files that are already compressed, such as video, do not shrink further.
+**Compression (zstd, lz4).** Making data smaller during the transfer, then restoring it at
+the destination. zstd and lz4 are two common methods. zstd usually makes data smaller.
+lz4 uses less processing power. Files that are already compressed, such as video, do not
+get smaller.
 
-**Destination.** The folder on the phone that files are copied into.
+**Destination.** The folder that receives the copied files.
 
-**Dry run.** Showing what would be copied, and how, without copying anything (`--dry-run`).
+**Dry run.** Showing what the engine would copy, and how, without copying (`--dry-run`).
 
-**Event.** One progress or status report from the engine to the app, written as a line of JSON.
+**Event.** One progress or status report from the engine to the app, as one line of JSON.
 
-**GB, MB, GiB, MiB.** Units of size. The engine reports binary units: 1 MiB is
-1,048,576 bytes and 1 GiB is 1,024 MiB (about 7% more than a GB). Speeds are shown in
-MiB per second (MiB/s).
+**GB, MB, GiB, MiB.** Units of size. The engine reports binary units. 1 MiB is 1,048,576
+bytes. 1 GiB is 1,024 MiB, about 7% more than 1 GB. Speeds are in MiB per second (MiB/s).
 
-**Group (batch).** A set of up to 200 small files sent together in one transfer.
+**Group (batch).** Up to 200 small files that the engine sends in one transfer.
 
-**JSON.** A standard text format for structured data that programs can read easily.
+**JSON.** A standard text format for structured data. Programs can read it easily.
 
-**Measurement (calibration).** The short test the engine runs to find the best settings
-for a phone, connection and destination. The saved results are sometimes called a *profile*.
+**Measurement (calibration).** The short test that finds the best settings for a phone,
+connection, and destination. The saved result is also called a *profile*.
 
-**Notarization.** Apple's check of an app before it can be opened on other people's Macs
+**Notarization.** Apple's check of an app. After this check, other Macs open the app
 without a warning.
 
-**Parallel transfer (stream).** One file transfer running at the same time as others.
-More parallel transfers keep the cable busier, up to a point.
+**Parallel transfer (stream).** One file transfer that runs at the same time as others.
+More parallel transfers keep the cable busier, up to a limit.
 
-**Part (split file).** A piece of a very large file. The pieces are sent at the same time
-and joined into the complete file on the phone.
+**Part (split file).** A piece of a very large file. The engine sends the pieces at the
+same time and joins them into the complete file at the destination.
 
-**Resume.** Continuing an interrupted copy by skipping files that already arrived
-(`--skip-existing`).
+**Process group.** A set of programs that the system can stop together with one signal.
+
+**Resume.** Continuing an interrupted copy. The engine skips the files that already
+arrived (`--skip-existing`).
 
 **Shared storage.** The main user storage on the phone, shown as `/sdcard` (also
 `/storage/emulated/0`). It holds Download, DCIM, Music, and similar folders. Android
-checks every file created here, which makes creating many small files slow, and it
-does not allow certain characters in names.
+checks every file that is created there. This makes many small files slow. Shared
+storage also refuses some characters in names.
 
-**USB 2.0 / USB 3.** Generations of USB. USB 2.0 runs at up to 480 Mb/s (about 40 MB/s
-in practice); USB 3 at 5 Gb/s or more. Both the cable and the port must support USB 3 to
-get its speed.
+**USB 2.0 / USB 3.** Generations of USB. USB 2.0 runs at up to 480 Mb/s, about 40 MB/s in
+practice. USB 3 runs at 5 Gb/s or more. The cable and the port must both support USB 3
+to get its speed.
 
-**USB debugging.** A setting under the phone's Developer options that allows adb
-connections. The phone asks once to allow each new computer.
+**USB debugging.** A setting in the phone's Developer options. It allows adb connections.
+The phone asks one time to allow each new computer.
 
-**Verify.** Checking after the copy that every file on the phone is identical to the
-original, using checksums.
+**Verify.** Checking after the copy that every file at the destination is the same as
+the original. The engine uses checksums for this.
