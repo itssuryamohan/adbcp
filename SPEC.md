@@ -145,11 +145,18 @@ checks every file, including the skipped ones.
 The engine looks for adb in this order and uses the first one it finds:
 
 1. A specific adb chosen by the user (the `ADB` environment variable).
-2. A copy bundled next to the engine (made with `adbcp --bundle`).
-3. adb already installed on the computer.
-4. A copy it downloaded earlier.
-5. Otherwise it downloads Google's official package once (about 16 MB) and checks that
-   Google's digital signature is valid before using it.
+2. A copy bundled next to the engine (made with `adbcp --bundle`, for personal use).
+3. adb on the `PATH`.
+4. The usual install places, which apps started from Finder cannot see through `PATH`:
+   Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`) and Android Studio's SDK
+   (`$ANDROID_HOME` or `~/Library/Android/sdk`).
+5. A copy it downloaded earlier (in `~/Library/Caches/adbcp`).
+6. Otherwise it downloads Google's official package once (about 16 MB) and checks that
+   Google's digital signature is valid before using it. With `ADBCP_NO_DOWNLOAD=1` it
+   stops with an error instead; the desktop app sets this and asks the user first.
+
+`adbcp --adb-status` shows which adb would be used, without downloading anything, and
+`adbcp --get-adb` downloads Google's package on request.
 
 ### 6.5 Measured performance
 
@@ -199,6 +206,8 @@ Events arrive roughly in this order. `progress` repeats about once a second duri
 | `error` | The copy cannot continue (also sent when cancelled, with message `interrupted`) | `message` |
 | `device` | One per phone, from `adbcp --devices --json` | `serial`, `state` (`device` when ready, or `unauthorized`, `offline`, …), `model`, `connection`, `link_mbps` |
 | `entry` | One per file or folder, from `adbcp --ls PATH --json` | `name`, `path`, `type` (`dir`, `file` or `other`), `size`, `mtime` |
+| `op_done` | After `--mkdir`, `--rename` or `--delete` succeeded | `op`, `count` (paths given) |
+| `adb` | From `--adb-status` and after `--get-adb` | `found`, `path`, `source` (`environment`, `bundled`, `path`, `homebrew`, `android-sdk` or `downloaded`), `version` |
 | `profile` | From `--show-profile PATH` and after `--measure PATH` | `saved` (false: built-in defaults apply), `kind` (`media`, `appdir` or `data`), `date`, `connection`, `link_mbps`, `streams`, `small_streams`, `small_kib`, `hash_workers`, `cores`, `large_mib_per_second`, `small_files_per_second` |
 
 Example:
@@ -229,6 +238,10 @@ or leftover process remains.
 - `adbcp -s SERIAL --show-profile PATH` shows the saved measurements for that phone,
   its connection and the kind of destination PATH is.
 - `adbcp -s SERIAL --measure PATH` measures now, without copying, and saves the result.
+- `adbcp -s SERIAL --mkdir PATH`, `--rename OLD NEW` and `--delete PATH...` make a folder,
+  rename, and delete on the phone, for the app's phone pane. Deleting is permanent (adb
+  has no trash). `--delete` refuses storage roots, system areas, the standard top-level
+  folders (such as DCIM, Download, Android), one-level paths and paths containing `..`.
 
 ## 8. Requirements
 
@@ -240,11 +253,11 @@ or leftover process remains.
 
 ## 9. Packaging and distribution
 
-- The app is a standard macOS application containing the engine (about 22 MB with adb;
-  see [app/SPEC.md](app/SPEC.md#5-building-and-testing)).
-- For personal use, Google's adb can be bundled inside. Google's license limits
-  redistributing adb, so a copy shared with other people should instead download adb
-  on first use, which the engine already does.
+- The app is a standard macOS application containing the engine
+  (see [app/SPEC.md](app/SPEC.md#5-building-and-testing)).
+- The app does not include Google's adb, because Google's license limits redistributing
+  it. It uses an adb already on the Mac, or asks the user before downloading Google's
+  package from Google (see 6.4). The app is about 3 MB.
 - An app shared with others must be signed and *notarized* by Apple, or macOS will refuse to open it.
 
 ## 10. Open questions

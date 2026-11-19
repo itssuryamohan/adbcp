@@ -46,8 +46,9 @@ compresses well. These numbers come from one phone; yours will differ.
 - **An Android phone with USB debugging turned on** (see below).
 - **A USB data cable.** A USB 3 cable in a USB 3 port is 5–10 times faster than USB 2.0;
   adbcp warns when the connection is slow.
-- **No adb installation needed.** If adb is not found, adbcp downloads Google's official
-  platform-tools once and checks Google's signature before using it.
+- **No adb installation needed.** adbcp uses an adb already on your Mac (PATH, Homebrew,
+  Android Studio). If there is none, the command-line tool downloads Google's official
+  platform-tools once and checks Google's signature; the app asks first.
 
 ### Turning on USB debugging
 
@@ -86,30 +87,37 @@ in file names, and `--json` prints machine-readable progress events.
 
 ## Desktop app
 
-A small window around the same tool, built with [Tauri 2](https://tauri.app). It shows
-the connected phone, lets you pick files or folders (or drag them in), browse the phone,
-see the measurements, and follow progress. It remembers your settings between launches.
+A two-pane file manager built on the same engine with [Tauri 2](https://tauri.app):
+this Mac on the left, the phone on the right. Select items and copy them across, drag
+them from one pane to the other, or drop files from Finder onto the phone pane. Both
+panes can make folders, rename and delete (on the Mac to the Trash; on the phone
+permanently, after asking). Copies queue up, and a transfer bar shows progress, speed,
+time left and any problems. Settings, measurements and the last folders are remembered.
 
 There are no prebuilt downloads; build it yourself:
 
 ```bash
 # Once: Rust (https://rustup.rs) and Node.js are needed
-./adbcp --bundle                 # downloads Google's adb into platform-tools/ for the app
 cd app
 npm install
 npm run build                    # needs ~/.cargo/bin on your PATH
 open src-tauri/target/release/bundle/macos/adbcp.app
 ```
 
-The app is about 22 MB, most of it the bundled adb. It is not signed by Apple, which is
-fine for an app you build yourself; sharing it with others would need signing and
-notarization.
+The app is about 3 MB. It does not include Google's adb: it uses the one already on
+your Mac (from your PATH, Homebrew or Android Studio), and otherwise asks before
+downloading Google's official package (about 16 MB, once, signature-checked). It is
+not signed by Apple, which is fine for an app you build yourself; sharing it with
+others would need signing and notarization. The current build runs on Apple Silicon Macs.
 
 ## Before you use it
 
 These are not bugs, but they can surprise you:
 
-- **Files with the same name are overwritten without asking**, in both directions.
+- **The command-line tool overwrites files with the same name without asking**, in both
+  directions. The desktop app asks first.
+- **Deleting on the phone is permanent**: adb has no trash. The app always asks first and
+  refuses to delete storage roots and standard folders such as DCIM or Download.
 - **"Skip existing" only compares file sizes.** Add `--verify` to compare the contents.
 - **The phone's shared storage (`/sdcard`) refuses some characters in names**
   (`" * : < > ? | \`). Such files are reported, or renamed with `--fix-names`.
@@ -141,7 +149,8 @@ app/             desktop app (Tauri 2: Rust + HTML/CSS/JavaScript)
 ## Third-party software
 
 - **adb** (Android platform-tools) is made by Google and covered by Google's own license.
-  It is not included in this repository; adbcp downloads it from Google when needed.
+  It is not included in this repository or in the app; adbcp downloads it from Google
+  when needed (the app asks first).
 - **Tauri** and the other Rust and npm packages used by the app are covered by their own
   licenses, listed in `app/src-tauri/Cargo.lock` and `app/package-lock.json`.
 

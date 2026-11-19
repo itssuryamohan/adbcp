@@ -66,6 +66,10 @@ options:
   --ls PATH         list a folder on the phone (with --json: one "entry" event each)
   --show-profile PATH  show the saved measurements for this phone and destination PATH
   --measure PATH    measure this phone, connection and destination PATH now, without copying
+  --mkdir PATH      make a folder on the phone
+  --rename OLD NEW  rename (move) OLD to NEW on the phone; refuses to replace anything
+  --delete PATH...  delete files or folders on the phone, permanently; storage roots and
+                    standard folders (/sdcard, Android, DCIM, Download, ...) are refused
   --fix-names       copy files whose names the phone does not allow (" * : < > ? | \)
                     with those characters replaced by _
   -s SERIAL         device to use (default: \$ANDROID_SERIAL or the only device)
@@ -88,6 +92,8 @@ options:
                     (default /sdcard/Download); size via --bench-size (default 1G)
   --recalibrate     measure this phone, link and destination again (see "tuning")
   --dry-run         print the transfer plan and exit
+  --adb-status      show which adb would be used (without downloading anything)
+  --get-adb         download Google's platform-tools into the cache now
   --bundle          download Google's adb into ./platform-tools next to this script,
                     making the folder self-contained (copy it to any Mac)
   -q                quiet: only errors and the final summary lines
@@ -107,8 +113,10 @@ is no profile; smaller ones use defaults. Compression is chosen by test-sending 
 sample of the copy's own data when it has 2 GiB or more of compressible files.
 -j overrides the measured big-file streams.
 
-adb lookup: \$ADB, then ./platform-tools/adb next to adbcp, then adb in PATH,
-then a cached download from dl.google.com (made on first use if none found).
+adb lookup: \$ADB, then ./platform-tools/adb next to adbcp, adb in PATH, Homebrew
+(/opt/homebrew/bin, /usr/local/bin), Android Studio's SDK (\$ANDROID_HOME or
+~/Library/Android/sdk), then a cached download from dl.google.com, made on first use
+if none is found (not when \$ADBCP_NO_DOWNLOAD=1).
 
 examples:
   adbcp movie.mkv /sdcard/Movies/
@@ -656,7 +664,7 @@ fetch_adb() {
   command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 || die "need curl and unzip to download adb"
   say "adb:" "downloading Android platform-tools from dl.google.com..."
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/adbcp-dl.XXXXXX") || die "mktemp failed"
-  if ! curl -fL --progress-bar -o "$tmp/pt.zip" "https://dl.google.com/android/repository/platform-tools-latest-$os.zip" ||
+  if ! curl -fL $([ $OUT_JSON = 1 ] && echo -sS || echo --progress-bar) -o "$tmp/pt.zip" "https://dl.google.com/android/repository/platform-tools-latest-$os.zip" ||
      ! unzip -q "$tmp/pt.zip" platform-tools/adb -d "$tmp"; then
     rm -rf "$tmp"; die "adb download failed"
   fi
@@ -670,17 +678,57 @@ fetch_adb() {
   say "adb:" "installed version ${ver:-(unknown)} in $dir/platform-tools"
 }
 
-resolve_adb() {
-  local c
+# Looks for adb without downloading it. Sets ADB and ADB_SOURCE, or returns 1.
+# Apps started from Finder do not get the Terminal's PATH, so the usual install places
+# (Homebrew, Android Studio's SDK) are searched too; ADBCP_ADB_SEARCH_COMMON=0 turns
+# that off (for tests).
+find_adb() {
+  local c src
   if [ -n "${ADB:-}" ]; then
     command -v "$ADB" >/dev/null 2>&1 || die "ADB=$ADB not found"
-    return
+    ADB_SOURCE=environment
+    return 0
   fi
-  for c in "${SELF%/*}/platform-tools/adb" "$(command -v adb 2>/dev/null)" "$(cache_dir)/platform-tools/adb"; do
-    if [ -n "$c" ] && [ -x "$c" ]; then ADB=$c; return; fi
-  done
+  while IFS='|' read -r src c; do
+    if [ -n "$c" ] && [ -x "$c" ]; then ADB=$c ADB_SOURCE=$src; return 0; fi
+  done <<EOF
+bundled|${SELF%/*}/platform-tools/adb
+path|$(command -v adb 2>/dev/null)
+$( [ "${ADBCP_ADB_SEARCH_COMMON:-1}" = 0 ] || printf '%s\n' \
+    "homebrew|/opt/homebrew/bin/adb" "homebrew|/usr/local/bin/adb" \
+    "android-sdk|${ANDROID_HOME:-$HOME/Library/Android/sdk}/platform-tools/adb" \
+    "android-sdk|${ANDROID_SDK_ROOT:-/nonexistent}/platform-tools/adb" )
+downloaded|$(cache_dir)/platform-tools/adb
+EOF
+  return 1
+}
+
+# find_adb, or else download Google's platform-tools once, unless ADBCP_NO_DOWNLOAD=1
+# (the desktop app sets it and asks the user before calling --get-adb).
+resolve_adb() {
+  find_adb && return 0
+  if [ "${ADBCP_NO_DOWNLOAD:-0}" = 1 ]; then
+    die "adb is not installed (Android platform-tools from Google are needed)"
+  fi
   fetch_adb "$(cache_dir)"
-  ADB=$(cache_dir)/platform-tools/adb
+  ADB=$(cache_dir)/platform-tools/adb ADB_SOURCE=downloaded
+}
+
+# --adb-status: where adb is, without downloading anything ("adb" event with --json).
+adb_status() {
+  local found=false ver=""
+  if find_adb; then
+    found=true
+    ver=$("$ADB" version 2>/dev/null | sed -n 's/^Version //p' | head -1)
+  fi
+  if [ $OUT_JSON = 1 ]; then
+    emit adb "$(jn found "$found")" "$(js path "$([ $found = true ] && echo "$ADB")")" \
+      "$(js source "$([ $found = true ] && echo "$ADB_SOURCE")")" "$(js version "$ver")"
+  elif [ $found = true ]; then
+    printf 'adb %s: %s (%s)\n' "${ver:-?}" "$ADB" "$ADB_SOURCE"
+  else
+    printf 'adb not found; adbcp downloads it from Google on first use, or run: adbcp --get-adb\n'
+  fi
 }
 
 # USB link speed in bits per second for a device serial (macOS only; empty if unknown).
@@ -760,6 +808,60 @@ measure_only() {
   probe_dir_remove_bg   # the probe's files are deleted on the phone after we return
   PROBE_RM=""
   report_profile true "$(dest_kind "$1")"
+}
+
+# True for phone paths that --delete refuses: storage roots, system areas, the standard
+# top-level folders, anything with only one path component, and paths with . or ..
+protected_path() {
+  local p=$1 n
+  while [ "$p" != / ] && [ "${p%/}" != "$p" ]; do p=${p%/}; done
+  case $p in */..|*/../*|*/.|*/./*|*//*) return 0 ;; esac
+  n=$p
+  case $n in
+    /storage/emulated/0|/storage/emulated/0/*) n=/sdcard${n#/storage/emulated/0} ;;
+    /storage/self/primary|/storage/self/primary/*) n=/sdcard${n#/storage/self/primary} ;;
+  esac
+  case $n in
+    /sdcard|/storage|/storage/*|/sdcard/Android|/sdcard/Android/data|/sdcard/Android/obb|\
+    /sdcard/DCIM|/sdcard/Download|/sdcard/Pictures|/sdcard/Movies|/sdcard/Music|/sdcard/Documents|\
+    /sdcard/Alarms|/sdcard/Notifications|/sdcard/Podcasts|/sdcard/Ringtones|/sdcard/Audiobooks|\
+    /sdcard/Recordings|/data|/data/*|/system|/system/*|/vendor|/vendor/*|/product|/product/*|\
+    /apex|/apex/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*)
+      # /storage/... other than emulated storage covers SD cards' roots too; /data/local/tmp
+      # contents stay deletable below.
+      case $n in /data/local/tmp/*|/storage/*/*/*) return 1 ;; esac
+      return 0 ;;
+  esac
+  case $n in /*/*) return 1 ;; esac
+  return 0
+}
+
+# --mkdir PATH, --rename OLD NEW, --delete PATH...: small file operations on the phone,
+# used by the app's phone pane. Deleting is permanent: adb has no trash.
+phone_op() {
+  local op=$1 p cmd="" err; shift
+  resolve_adb
+  for p in "$@"; do case $p in /*) ;; *) die "phone paths must be absolute: $p" ;; esac; done
+  case $op in
+    mkdir)
+      [ $# -eq 1 ] || die "--mkdir takes one path"
+      cmd="[ -e $(rq "$1") ] && { echo 'already exists'; exit 3; }; mkdir -p $(rq "$1")" ;;
+    rename)
+      [ $# -eq 2 ] || die "--rename takes the old and the new path"
+      protected_path "$1" && die "refusing to rename $1"
+      cmd="[ -e $(rq "$1") ] || { echo 'not found'; exit 3; }
+        [ -e $(rq "$2") ] && { echo 'something with that name already exists'; exit 3; }
+        mv $(rq "$1") $(rq "$2")" ;;
+    delete)
+      [ $# -ge 1 ] || die "--delete takes at least one path"
+      for p in "$@"; do
+        protected_path "$p" && die "refusing to delete $p (a storage root or standard folder)"
+        cmd="$cmd rm -rf $(rq "$p") || exit 1;"
+      done ;;
+  esac
+  err=$("$ADB" shell "$cmd" </dev/null 2>&1) || die "$(printf '%s' "${err:-$op failed}" | tr -d '\r' | head -1)"
+  if [ $OUT_JSON = 1 ]; then emit op_done "$(js op "$op")" "$(jn count "$#")"
+  else say "Done:" "$op $*"; fi
 }
 
 # --ls PATH: the folders and files directly inside PATH on the phone.
@@ -857,7 +959,7 @@ bench() {
 # -------------------------------------------------------------------- main ---
 main() {
   J=8 COMP=auto CHUNK=$((128 * BS)) SPLIT_MIN=$((256 * BS)) NO_SPLIT=0 VERIFY=0
-  PULL=0 LIST_DEVICES=0 LS_PATH="" SHOW_PROFILE="" MEASURE="" FIX_NAMES=0 J_SET=0 RECAL=0 SPLIT_SET=0 SKIP_EXISTING=0 DRY=0 FORCE=0 BURST=0 LIBUSB=0 BENCH=0 BENCH_SIZE=$((1024 * BS))
+  ADB_STATUS=0 GET_ADB=0 PULL=0 LIST_DEVICES=0 LS_PATH="" SHOW_PROFILE="" MEASURE="" FIX_NAMES=0 PHONE_OP="" J_SET=0 RECAL=0 SPLIT_SET=0 SKIP_EXISTING=0 DRY=0 FORCE=0 BURST=0 LIBUSB=0 BENCH=0 BENCH_SIZE=$((1024 * BS))
   local args=() a
   while [ $# -gt 0 ]; do
     case $1 in -s|-j|-z|--chunk|--split-min|--bench-size|--ls|--show-profile|--measure)
@@ -881,8 +983,13 @@ main() {
       --show-profile) SHOW_PROFILE=$2; shift ;;
       --measure) MEASURE=$2; shift ;;
       --fix-names) FIX_NAMES=1 ;;
+      --mkdir) PHONE_OP=mkdir ;;
+      --rename) PHONE_OP=rename ;;
+      --delete) PHONE_OP=delete ;;
       --ls) LS_PATH=$2; shift ;;
       --bundle) fetch_adb "${SELF%/*}"; exit 0 ;;
+      --adb-status) ADB_STATUS=1 ;;
+      --get-adb) GET_ADB=1 ;;
       --libusb) LIBUSB=1 ;;
       --bench) BENCH=1 ;;
       --dry-run) DRY=1 ;;
@@ -906,10 +1013,13 @@ main() {
   CHUNK=$(( (CHUNK + BS - 1) / BS * BS )); [ $CHUNK -gt 0 ] || CHUNK=$BS
   BENCH_SIZE=$(( (BENCH_SIZE + BS - 1) / BS * BS ))
   [ $BENCH = 1 ] && { bench "$@"; exit; }
+  [ $ADB_STATUS = 1 ] && { adb_status; exit 0; }
+  [ $GET_ADB = 1 ] && { ADB=""; fetch_adb "$(cache_dir)"; adb_status; exit 0; }
   [ $LIST_DEVICES = 1 ] && { list_devices; exit 0; }
   [ -z "$LS_PATH" ] || { list_dir "$LS_PATH"; exit 0; }
   [ -z "$SHOW_PROFILE" ] || { show_profile "$SHOW_PROFILE"; exit 0; }
   [ -z "$MEASURE" ] || { measure_only "$MEASURE"; exit; }
+  [ -z "$PHONE_OP" ] || { phone_op "$PHONE_OP" "$@"; exit 0; }
   [ $# -ge 2 ] || usage 1
 
   local dest=${!#} n=$(($# - 1)) dest_is_dir=0

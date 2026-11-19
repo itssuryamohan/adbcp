@@ -4,12 +4,12 @@ Specification for the window around the adbcp copy engine
 
 | | |
 |---|---|
-| Status | Version 0.2.0 built. Copies in both directions work end to end. |
+| Status | Version 0.3.0 built: two-pane window. Copies in both directions work end to end. |
 | Platform | macOS 11 or newer, Apple Silicon and Intel |
 | Built with | *Tauri* 2: a small Rust program that shows a window drawn with HTML, CSS and JavaScript |
-| Size | About 22 MB: the app itself is 3.3 MB; the rest is Google's adb (18 MB) and the engine |
+| Size | About 3 MB. Google's adb is not included (see 3.1). |
 | Engine | The command-line tool described in [../SPEC.md](../SPEC.md). The app runs it and shows what it reports. |
-| Last updated | 2026-11-05 |
+| Last updated | 2026-11-19 |
 
 Terms in *italics* are explained in the [Glossary](#glossary) at the end and in the
 [engine glossary](../SPEC.md#glossary).
@@ -19,165 +19,157 @@ Terms in *italics* are explained in the [Glossary](#glossary) at the end and in 
 ## 1. Purpose
 
 The engine is fast but is used from the Terminal. The app gives the same copies a
-window: pick a phone, pick what to copy and where, press Start, and watch the progress.
+window in the style of a two-pane file manager: this Mac on one side, the phone on the
+other, and copying is moving things across.
 All copying, measuring and checking is done by the engine. The app only collects
 choices, starts the engine, and presents its reports.
 
 ## 2. The window
 
+Two side-by-side file panes, like Finder windows: this Mac on the left, the phone on the
+right. Copying is moving things from one pane to the other. A transfer bar at the bottom
+shows the copy in progress; settings live in a sheet opened with the gear button.
+
 ```
-┌ adbcp ─────────────────────────────────────────────────────────────┐
-│ Phone      [ SM-S918B · USB 5 Gb/s                    ▾ ] [Refresh] │
-│ Direction  (•) Computer to phone   ( ) Phone to computer            │
-│ Copy                         [Add files…] [Add folder…] [Remove]    │
-│ ┌────────────────────────────────────────────────────────────────┐  │
-│ │ Uncharted…PS4    /Users/surya/Documents/Games/Uncharted…        │  │
-│ │ trip.mp4         /Users/surya/Movies/trip.mp4                   │  │
-│ └────────────────────────────────────────────────────────────────┘  │
-│ To         [ /sdcard/Games/                          ] [Browse…]    │
-│            [x] Verify after copying   [ ] Skip files already there  │
-│ Tuning     Measured 2026-11-05 for shared storage: 8 …  [Measure now]│
-│ ▸ Advanced settings                                                 │
-│ 15,177 files, 58.5 GiB → /sdcard/Games                              │
-│ 3,024 large files on 8 parallel transfers, 12,153 small files …     │
-│ [==================>              ]                                 │
-│ 61% · 36.0 GiB of 58.5 GiB · 398 MiB/s · about 0:58 left · 9,410 …  │
-│ ▸ Problems (1)                                                      │
-│ ▸ Details                                                           │
-│ [Retry failed files] [Copy with safe names]        [Cancel] [Start] │
-└─────────────────────────────────────────────────────────────────────┘
+┌ adbcp ───────────────────────────────────────────────────────────────────────────────┐
+│ Phone [ SM-S918B · USB 5 Gb/s       ▾ ] [Refresh]                         [⚙ Settings] │
+│ ┌ This Mac ──────────────────────────────┐ ┌ Phone ──────────────────────────────────┐ │
+│ │ [↑] [/Users/surya/Movies          ] [▾]│ │ [↑] [/sdcard/Movies              ] [▾]  │ │
+│ │ [New folder] [Rename] [Move to Trash] ⟳│ │ [New folder] [Rename] [Delete]       ⟳  │ │
+│ │ Name                  Size    Modified │ │ Name                  Size    Modified  │ │
+│ │ 📁 Holiday 2026          —   12 Oct    │ │ 📁 Camera                —   3 Nov      │ │
+│ │ 📄 trip.mp4         1.2 GiB   4 Nov    │ │ 📄 clip.mp4         640 MiB   1 Nov     │ │
+│ │ …                                      │ │ …                                       │ │
+│ │ 2 selected · 1.2 GiB    [Copy to phone →]│ │ [← Copy to Mac]           1 selected   │ │
+│ └────────────────────────────────────────┘ └─────────────────────────────────────────┘ │
+│ Copying 2 items to /sdcard/Movies · 8 parallel transfers · zstd                         │
+│ [==================>                ] 61% · 0.7 of 1.2 GiB · 398 MiB/s · 0:02 left      │
+│ ▸ Problems  ▸ Details                  1 copy waiting   [Retry] [Safe names] [Cancel]   │
+└───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The window follows the Mac's light or dark appearance. When the content does not fit
-(for example with Advanced settings open), it scrolls while Start and Cancel stay visible.
+The window follows the Mac's light or dark appearance.
 
 ## 3. Using the app
 
 ### 3.1 Phone
 
-- The list shows every phone adb can see, with its model and connection, for example
-  "SM-S918B · USB 5 Gb/s". The first ready phone is selected. **Refresh** looks again.
-- Phones that are not ready are listed but cannot be chosen, with the reason: "allow this
-  computer on the phone", "offline", and so on.
-- A note under the list explains what to do when no phone is found (cable, *USB debugging*,
-  allowing the computer), or warns when the phone is connected at USB 2.0 speed.
+- **adb first:** the app needs Google's adb but does not include it (Google's license
+  limits redistributing it). At launch it looks for one already on the Mac (PATH,
+  Homebrew, Android Studio, or one it downloaded before). If there is none, it asks:
+  "adbcp needs Google's adb", with **Not now**, **Google's terms…** (opens Google's
+  Platform-Tools page) and **Download** (about 16 MB from Google, once, with its
+  signature checked). After "Not now" the phone pane explains how to get adb, and
+  **Refresh** asks again. Settings shows which adb is used and where it came from.
+- The list at the top shows every phone adb can see, with its model and connection, for
+  example "SM-S918B · USB 5 Gb/s". The first ready phone is selected. **Refresh** looks again.
+- Phones that are not ready are listed but cannot be chosen, with the reason ("allow this
+  computer on the phone", "offline", …).
+- Without a ready phone, the phone pane explains what to do (cable, *USB debugging*,
+  allowing the computer). A note warns when the phone is connected at USB 2.0 speed.
 
-### 3.2 Direction
+### 3.2 The two panes
 
-- **Computer to phone** (the default) or **Phone to computer**.
-- Switching clears the list of things to copy, because they are on the other side, and
-  switches the destination to the one last used for that direction.
-  The default destination is `/sdcard/Download/` on the phone, or the Mac's Downloads folder.
+Both panes work the same way:
 
-### 3.3 What to copy
+- **Path bar:** **↑** goes up one folder; the path can be typed (Enter to go); the **▾**
+  menu has common places. On the Mac: Home, Desktop, Documents, Downloads, Movies, Music,
+  Pictures and external drives. On the phone: Internal storage, Download, DCIM, Pictures,
+  Movies, Music, Documents, and the app folders (`Android/data`, `Android/obb`).
+- **List:** folders first, then files, with size and date. Click a column title to sort
+  by it. Double-click (or Enter) opens a folder. Hidden items (names starting with `.`)
+  appear when **Show hidden** is ticked in Settings.
+- **Selecting:** click selects one item, ⌘-click adds or removes one, Shift-click
+  selects a range, ⌘A selects everything. The pane's footer shows how many items are
+  selected and the size of the selected files.
+- **Keyboard:** ⌘↑ goes up, Enter opens, ⌘A selects all, ⌘⌫ deletes (with
+  confirmation), ⇧⌘N makes a new folder.
+- **File operations:** **New folder**, **Rename** (one item) and **Delete**. On the Mac,
+  Delete moves items to the Trash. On the phone, deleting is permanent (adb has no
+  trash): the app always asks first and names what will be deleted. The phone's storage
+  roots and standard folders (such as `/sdcard`, `Android`, `DCIM`, `Download`) cannot be
+  deleted from the app. New names are checked for characters the phone does not allow.
+- The phone pane opens at the last phone folder used, or `/sdcard/Download`; the Mac pane
+  at the last Mac folder used, or Downloads.
 
-- **Computer to phone:** **Add files…** and **Add folder…** open the standard Mac
-  pickers; files and folders can also be dragged from Finder onto the window. While
-  something is dragged over the window, the list shows "Drop to add to the list". When
-  copying from the phone, or during a copy, it explains instead why dropping is not possible.
-- **Phone to computer:** **Add from phone…** opens the phone browser (3.5) with tick
-  boxes; ticked files and folders are added.
-- Click items in the list to select them, then **Remove**.
-- Folders are copied with everything inside. macOS housekeeping files are left out by the engine.
+### 3.3 Copying
 
-### 3.4 Destination
+- **Copy to phone →** copies what is selected in the Mac pane into the folder open in
+  the phone pane; **← Copy to Mac** does the opposite.
+- **Dragging:** drag selected items from one pane and drop them on the other pane to
+  copy them there; dropping on a folder in the other pane copies into that folder. Files
+  and folders dragged from Finder can be dropped on the phone pane. While something is
+  dragged, the pane that would receive it is highlighted with "Drop to copy here"; the
+  Mac pane does not accept drops from Finder (that would just copy within the Mac).
+- **Names that already exist:** if items with the same names are already in the
+  destination folder, the app asks **Replace**, **Skip existing** (leaves files that are
+  already there with the same size) or **Cancel**. A setting can make this automatic.
+- **Queue:** copies started while another one runs wait their turn; the transfer bar
+  shows how many are waiting. **Cancel** stops the current copy and clears the waiting ones.
+- When a copy finishes, both panes are refreshed.
 
-- **Computer to phone:** type a phone folder starting with `/`, or use **Browse…** to pick
-  one in the phone browser.
-- **Phone to computer:** type a folder on the Mac, or use **Browse…** for the standard
-  Mac folder picker.
+### 3.4 The transfer bar
 
-### 3.5 Phone browser
+- While copying: what is being copied and where, the plan the engine chose (parallel
+  transfers, compression, saved or new measurements), and a progress bar with
+  percentage, amount, speed, time left and files done. During verification the bar shows
+  activity. If the engine measures the phone first, the bar says so.
+- **Problems** lists files that failed, as they fail, with the reason. **Details** shows
+  everything the engine reported.
+- After a copy: the result in one line ("Copied 2 files, 1.2 GiB in 0:04 (301 MiB/s).
+  Verified: all 2 files match."), plus what went wrong if anything did.
+- **Retry failed files** runs the same copy again with "skip existing" on. Files whose
+  names the phone does not allow are left out of a retry and reported again.
+- **Copy with safe names** appears when files have names the phone does not allow, and
+  copies them with each disallowed character replaced by `_` (for example
+  `sound:effects.bnk` becomes `sound_effects.bnk`). Problems shows the new names first.
+- **Cancel** stops the copy within a second; finished files stay, partly copied ones are
+  removed. Quitting the app during a copy stops it the same way.
 
-A panel over the window that lists one phone folder at a time, folders first. Click a
-folder name to open it, **↑** to go up. Hidden files (names starting with `.`) are
-hidden unless **Show hidden** is ticked. When choosing a destination, files are dimmed
-and the button reads **Choose this folder**; when adding things to copy, each entry has
-a tick box and the button reads **Add N items**. Esc or **Cancel** closes it.
+### 3.5 Settings
 
-### 3.6 Settings
+The gear button opens a sheet:
 
-| Setting | Where | Default | Remembered | Engine option |
-|---|---|---|---|---|
-| Verify after copying | Main window | On | Yes | `--verify` |
-| Skip files already there | Main window | Off | No | `--skip-existing` |
-| Parallel transfers | Advanced | Automatic (measured) | Yes | `-j N` |
-| Compression | Advanced | Automatic (tests the data) | Yes | `-z none\|zstd\|lz4` |
-| Split very large files | Advanced | Automatic | Yes | `--no-split` when off |
-| Part size | Advanced | 128 MiB | Yes | `--chunk`, only when changed |
-| Split files from | Advanced | 256 MiB | Yes | `--split-min`, only when changed |
-| Replace characters the phone does not allow with `_` | Advanced | Off | Yes | `--fix-names` |
-| Burst mode (experimental) | Advanced | Off | Yes | `--burst` |
-| libusb connection (experimental) | Advanced | Off | Yes | `--libusb` |
-| Skip the free-space check | Advanced | Off | No | `--force` |
+| Setting | Default | Engine option |
+|---|---|---|
+| Verify after copying | On | `--verify` |
+| When names already exist | Ask | (Replace: plain copy; Skip existing: `--skip-existing`) |
+| Show hidden files | Off | — |
+| Tuning: measurements and **Measure now** | — | `--show-profile`, `--measure` |
+| Parallel transfers | Automatic (measured) | `-j N` |
+| Compression | Automatic (tests the data) | `-z none\|zstd\|lz4` |
+| Split very large files | Automatic | `--no-split` when off |
+| Part size | 128 MiB | `--chunk`, only when changed |
+| Split files from | 256 MiB | `--split-min`, only when changed |
+| Replace characters the phone does not allow with `_` | Off | `--fix-names` |
+| Burst mode (experimental) | Off | `--burst` |
+| libusb connection (experimental) | Off | `--libusb` |
+| Skip the free-space check | Off | `--force` |
+
+**Tuning** shows what the engine knows about the selected phone, its connection and the
+kind of folder open in the phone pane (shared storage, app folders, or `/data`), for
+example "Measured 2026-11-05 for shared storage: 8 parallel transfers for large files,
+up to 4 for small files", or that it is not measured yet. **Measure now** measures there
+(about 10 seconds) and saves the result. Copies from the phone use fixed settings.
 
 Part size and the split threshold are passed to the engine only when changed: an
 explicit value keeps splitting on even where the engine would switch it off by itself
-(on a USB 2.0 link, where it does not help). Both are greyed out when splitting is off.
-The experimental options restart adb, which briefly disconnects other adb tools; burst
-mode was slower on real copies in testing.
+(on a USB 2.0 link). The experimental options restart adb, which briefly disconnects
+other adb tools; burst mode was slower on real copies in testing.
 
-### 3.7 Measurements (Tuning)
+All settings except "Skip the free-space check" are remembered, together with the last
+folder of each pane and each pane's sort order, in
+`~/Library/Application Support/dev.adbcp.desktop/settings.json`.
 
-The **Tuning** row shows what the engine knows about the selected phone, its connection
-and the kind of destination (shared storage, app folders, or `/data`):
-
-- "Measured 2026-11-05 for shared storage: 8 parallel transfers for large files, up to 4
-  for small files." Hovering shows the measured speeds.
-- "Not measured yet for this phone and app folders. It is measured automatically before
-  the first large copy (about 10 seconds), or now."
-- When copying from the phone: "Copies from the phone use fixed settings …", and no button.
-
-**Measure now** measures the phone at the current destination (about 10 seconds) and
-saves the result; the row says "Measuring …" meanwhile and other controls are locked.
-The row updates when the phone, direction or kind of destination changes, and after
-every copy (a large copy may have measured the phone by itself).
-
-### 3.8 Remembered settings
-
-Direction, the last destination for each direction, Verify, everything under Advanced
-settings except the free-space check, and whether Advanced settings is open are saved
-on every change and restored at the next launch. What to copy, "Skip files already
-there" and "Skip the free-space check" are deliberately not remembered: they belong to
-one copy. The file is `~/Library/Application Support/dev.adbcp.desktop/settings.json`.
-
-### 3.9 During a copy
-
-- All controls except **Cancel** are locked.
-- Two summary lines show what is being copied and the plan the engine chose: number of
-  large and small files, parallel transfers, compression, and whether saved measurements
-  or new ones are used. If the engine measures the phone first, the status line says so.
-- The progress bar and status line update about once a second: percentage, amount, speed,
-  time left, and files done or failed. During verification the bar shows activity.
-- Files that fail appear under **Problems** as they fail, with the reason.
-- **Details** shows everything the engine reported, including warnings.
-- **Cancel** asks the engine to stop. It stops within a second; finished files stay,
-  partly copied ones are removed, and "Skip files already there" is ticked so that
-  Start continues where it stopped.
-- Quitting the app during a copy stops the copy the same way.
-
-### 3.10 After a copy
-
-- The status line ends with the result, for example "Copied 15,176 files, 58.5 GiB in
-  2:34 (389 MiB/s). Verified: all 15,176 files match."
-- A line below it says plainly whether everything worked, and if not, what failed.
-- **Retry failed files** appears when files could not be copied or failed verification.
-  It runs the same copy again with "Skip files already there" on. Files whose names the
-  phone does not allow are left out of a retry and reported again at the end.
-- **Copy with safe names** appears when files have names the phone does not allow. It
-  copies them with each disallowed character replaced by `_` (for example
-  `sound:effects.bnk` becomes `sound_effects.bnk`), skipping everything already there.
-  Problems lists the new name for each file before you press it. This applies to that
-  one copy; the Advanced setting does the same for every copy.
-
-### 3.11 Messages
+### 3.6 Messages
 
 | Situation | What the app shows |
 |---|---|
-| No phone found | How to connect: cable, USB debugging, allow this computer, then Refresh |
+| No phone found | In the phone pane: how to connect (cable, USB debugging, allow this computer), then Refresh |
 | Phone connected at USB 2.0 speed | A note that a USB 3 cable and port can be 5–10 times faster |
-| Destination on the phone does not start with `/` | Asks for a full phone path such as `/sdcard/Download/` |
-| A name the phone does not allow | Listed under Problems with the name it would get with safe names; **Copy with safe names** is offered |
+| Names already exist in the destination | Replace / Skip existing / Cancel |
+| Deleting on the phone | "Delete N items from the phone? This cannot be undone." with the names |
+| A name the phone does not allow | When naming: the characters to avoid. When copying: listed under Problems with the name it would get, and **Copy with safe names** |
 | A copy that differs after verification | Listed under Problems: "The copy is different from the original." |
 | The engine stops with an error | The error message, with Details opened |
 
@@ -196,22 +188,34 @@ one copy. The file is `~/Library/Application Support/dev.adbcp.desktop/settings.
 
   | Command | What it does |
   |---|---|
+  | `adb_status` | Runs `adbcp --adb-status --json`: which adb would be used, without downloading |
+  | `get_adb` | Runs `adbcp --get-adb --json`, after the user agreed to download Google's adb |
+  | `open_adb_terms` | Opens Google's Platform-Tools page (a fixed address) in the browser |
   | `list_devices` | Runs `adbcp --devices --json` |
-  | `list_dir` | Runs `adbcp -s SERIAL --ls PATH --json`, for the phone browser |
+  | `list_dir` | Runs `adbcp -s SERIAL --ls PATH --json`, for the phone pane |
+  | `list_local` | Lists a folder on the Mac, for the Mac pane |
+  | `local_places` | Home, Desktop, Documents, Downloads, Movies, Music, Pictures and external drives |
+  | `local_mkdir`, `local_rename` | New folder and rename on the Mac (rename never replaces anything) |
+  | `local_trash` | Moves items on the Mac to the Trash |
+  | `phone_op` | Runs `adbcp -s SERIAL --mkdir`, `--rename` or `--delete` for the phone pane |
   | `show_profile` | Runs `adbcp -s SERIAL --show-profile DEST --json`, for the Tuning row |
   | `measure` | Runs `adbcp -s SERIAL --measure DEST --json` (Measure now); refused during a copy |
   | `load_settings`, `save_settings` | Read and write the remembered settings file |
-  | `pick_local` | Shows the standard Mac file or folder picker |
   | `start_copy` | Starts the engine with `--json` and the chosen options |
   | `cancel_copy` | Sends the engine the same stop signal as Ctrl-C |
   | `autorun` | Test hook (see 5.3) |
 
   It forwards the engine's output to the window as three events: `engine-event` (one per
   JSON line, see [engine events](../SPEC.md#71-events)), `engine-log` (readable messages)
-  and `engine-exit` (the result code). Dragging over the window sends `drag-hover`
-  (true or false); dropped files arrive as `files-dropped`.
-- **Engine and adb** are copied into the app (`Contents/Resources/engine/`). The engine
-  finds the bundled adb next to itself.
+  and `engine-exit` (the result code). Files dragged from Finder send `drag-hover`
+  (whether something is over the window, and where) and `files-dropped` (the paths and
+  where they were dropped), so the window can tell which pane they are over.
+- **Dragging between the panes** is handled inside the window with mouse events rather
+  than the browser's drag and drop, which competes with the window's own handling of
+  files dropped from Finder.
+- **The engine** is copied into the app (`Contents/Resources/engine/`); adb is not. Every
+  engine run from the app has `ADBCP_NO_DOWNLOAD=1`, so the engine never downloads adb
+  by itself: only `get_adb`, after the user agreed, does.
 - **Safety details:**
   - The window cannot pass arbitrary options to the engine; the Rust core builds the
     command from typed fields.
@@ -229,8 +233,8 @@ app/
   package.json         build scripts and the Tauri command-line tool
   src/                 the window: index.html, styles.css, main.js
   src-tauri/
-    Cargo.toml         Rust dependencies (tauri, tauri-plugin-dialog, serde, libc)
-    tauri.conf.json    app name, window size, bundled engine and adb
+    Cargo.toml         Rust dependencies (tauri, serde, libc, trash)
+    tauri.conf.json    app name, window size, bundled engine
     capabilities/      what the window is allowed to call
     icons/             app icons
     src/main.rs        the Rust core
@@ -253,39 +257,42 @@ makes the app use that engine instead of the bundled one.
 ### 5.3 Test hook
 
 When the environment variable `ADBCP_APP_AUTORUN` holds a copy request in JSON, the
-window fills it in and starts it on launch, so a copy can be tested without clicking:
+window opens the destination folder in its pane and starts the copy on launch, so a copy
+can be tested without clicking:
 
 ```bash
 ADBCP_APP_AUTORUN='{"sources":["/Users/me/Movies"],"dest":"/sdcard/Movies/","verify":true}' \
   src-tauri/target/release/bundle/macos/adbcp.app/Contents/MacOS/adbcp-app
 ```
 
-Fields: `sources`, `dest`, `verify` (default true), `skipExisting`, `fixNames`, `pull`.
+Fields: `sources`, `dest`, `verify` (default true), `skipExisting`, `fixNames`, `pull`,
+and `downloadAdb` (download Google's adb without asking, if none is found).
 The test hook goes through the normal window logic, so it also writes the settings file.
 
 ### 5.4 What has been tested
 
 | Test | Result |
 |---|---|
-| The built app copies a folder (two large files and 50 small ones) to the phone, with verify, through the test hook | All 52 files arrived; their checksums match the originals |
-| The built app copies the same folder back from the phone | Identical to the original; no temporary files left |
-| The window rendered in the Mac's web engine with simulated phone data: ready, copying, finished with a problem, problems open, phone browser; light and dark | Layout and texts as intended (two texts fixed after review) |
-| The engine's phone and folder listings (`--devices`, `--ls`) | Correct, valid JSON, clear error for a missing folder |
-| Cancelling through the engine's process group, the same mechanism the app uses | Stops in under a second, nothing left behind (tested with the engine) |
-| The built app copies files named `what?.txt` and `lev:el/map.dat` with safe names, with verify | Arrived as `what_.txt` and `lev_el/map.dat` with the right contents |
-| The built app writes the settings file | Written with the expected values |
-| Rendered states for this version: measurements shown, not measured yet, measuring, Advanced settings open, drag accepted and refused, name problems with "Copy with safe names"; light and dark | As intended after two layout fixes (buttons hidden by Advanced settings; the phone browser's buttons) |
-| Engine: `--show-profile` (including a profile saved by an older version), `--measure`, `--fix-names` with clashing names, failure reasons in JSON | All correct |
+| The built two-pane app copies a folder (two large files and 60 small ones) to the phone and back, with verify, through the test hook | All 62 files arrived; the copy back is identical to the original; no temporary files left |
+| The built app writes the settings file (last folders, Verify, name-clash choice) | Written with the expected values |
+| The built app without bundled adb, started with the limited PATH a Finder launch gets | Found Homebrew's adb; the copy arrived |
+| The built app with no adb anywhere (empty home folder, usual places turned off), test hook accepting the download | Downloaded Google's adb (signature by Google, team EQHXZ8M8AV), then copied; the copy arrived |
+| Rendered: the download dialog, the phone pane after "Not now", Settings showing the adb used | As intended after one fix (phone pane buttons before the check) |
+| The window rendered in the Mac's web engine with simulated Mac and phone folders and engine events, light and dark: two panes with a selection; the name-clash dialog, then copying with a waiting copy; dragging across, with the drop target highlighted; a finished copy with a name problem and "Copy with safe names"; the phone delete confirmation; settings; Finder drops accepted on the phone pane and refused on the Mac pane; no phone | As intended after two fixes (the places menu; the refresh symbol) |
+| Engine phone operations on the device: new folder, rename, delete; refusing an existing name, a missing item, a rename onto an existing name; the exact argument order the app uses | All correct |
+| The delete guard: `/`, `/sdcard` (with and without a trailing `/`), DCIM, Download, `/storage/emulated/0` and its Download, Android, Android/data, `/data/local/tmp`, `/system`, a one-level path, a path with `..`, a relative path | All refused, before anything reaches the phone |
+| Engine features from earlier versions: measurements, safe names, verify, resume, cancel | See earlier rows in the git history of this file; unchanged by this version |
 
-Not yet tested by hand in the real window: clicking through the controls, dragging
-files from Finder (including the drop hint), the Mac file pickers, Measure now, and the
-Cancel button itself. These need a person at the Mac.
+Not yet tested by hand in the real window: clicking and keyboard use, dragging between
+the panes and from Finder, the Trash on the Mac, Measure now, the Cancel button, and the
+download dialog's buttons (including opening Google's terms). These need a person at the Mac.
 
 ## 6. Not built yet
 
-- Renaming individual files by hand before copying (today: automatic safe names).
-- Distribution to other people: signing and notarization by Apple, and downloading adb
-  on first use instead of bundling it (see the engine spec, section 9).
+- Copying within one side (Mac to Mac or phone to phone), and moving instead of copying.
+- Reordering or removing copies that are waiting in the queue.
+- Distribution to other people: signing and notarization by Apple.
+- A build that also runs on Intel Macs (today: Apple Silicon only).
 - A Linux build.
 
 ## 7. Decisions and open questions
@@ -299,6 +306,15 @@ Decided:
    disallowed characters; an Advanced setting does this for every copy.
 3. Part size, the split threshold and the experimental connection modes are in
    Advanced settings.
+4. The two-pane window replaced the single copy window (version 0.3.0). Rather than
+   forking OpenMTP, the window was built on the existing engine and Tauri app, keeping
+   the app small (about 3 MB without adb).
+5. Deleting on the Mac moves items to the Trash; deleting on the phone is permanent and
+   always asks first, and storage roots and standard folders cannot be deleted.
+6. Copying onto existing names asks Replace / Skip existing / Cancel by default.
+7. The app does not bundle Google's adb (version 0.3.0 onward). It uses an installed
+   adb or asks before downloading Google's package, so the app can be shared without
+   redistributing Google's software.
 
 Open:
 

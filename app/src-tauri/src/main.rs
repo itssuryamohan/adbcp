@@ -1,6 +1,7 @@
 // adbcp desktop app: a window around the adbcp copy engine (see ../../SPEC.md).
 //
-// The engine is the bash script bundled under Resources/engine. This side starts it
+// The engine is the bash script bundled under Resources/engine. Google's adb is not
+// bundled: the engine finds an installed one, or the window asks before downloading it. This side starts it
 // with --json, forwards its events to the window ("engine-event", "engine-log",
 // "engine-exit"), and cancels it with SIGINT. The engine runs in its own process group
 // so that its interrupt handler can stop every transfer it started.
@@ -11,10 +12,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_dialog::DialogExt;
 
 /// Process id of the running copy, which is also its process group id.
 #[derive(Default)]
@@ -44,14 +44,20 @@ fn engine_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn engine(app: &AppHandle) -> Result<Command, String> {
     let mut cmd = Command::new("/bin/bash");
     cmd.arg(engine_path(app)?);
+    // Google's adb is not bundled. The engine must never download it on its own from
+    // the app: the window asks first, then calls get_adb.
+    cmd.env("ADBCP_NO_DOWNLOAD", "1");
     Ok(cmd)
 }
+
+/// Google's page for the Android SDK Platform-Tools, with their terms.
+const ADB_TERMS_URL: &str = "https://developer.android.com/tools/releases/platform-tools";
 
 /// Runs a short engine query (--devices, --ls) and returns its JSON events.
 fn query(app: &AppHandle, args: Vec<String>) -> Result<Vec<Value>, String> {
     let out = engine(app)?
+        .arg("--json") // before the arguments: a "--" among them ends the options
         .args(&args)
-        .arg("--json")
         .stdin(Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
@@ -69,6 +75,25 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tauri::async_runtime::spawn_blocking(f)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Which adb the engine would use, without downloading anything.
+#[tauri::command]
+async fn adb_status(app: AppHandle) -> Result<Vec<Value>, String> {
+    blocking(move || query(&app, vec!["--adb-status".into()])).await?
+}
+
+/// Downloads Google's platform-tools (about 16 MB) after the user agreed in the window.
+#[tauri::command]
+async fn get_adb(app: AppHandle) -> Result<Vec<Value>, String> {
+    blocking(move || query(&app, vec!["--get-adb".into()])).await?
+}
+
+/// Opens Google's Platform-Tools page (and only that page) in the default browser.
+#[tauri::command]
+fn open_adb_terms() -> Result<(), String> {
+    Command::new("/usr/bin/open").arg(ADB_TERMS_URL).status().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -107,6 +132,122 @@ async fn measure(app: AppHandle, serial: String, dest: String) -> Result<Vec<Val
     result?
 }
 
+/// One entry of a folder listing, for either pane (the engine's --ls entries have the
+/// same fields).
+#[derive(Serialize)]
+struct Entry {
+    name: String,
+    path: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    size: u64,
+    mtime: u64,
+}
+
+/// The folders and files directly inside `path` on this Mac.
+#[tauri::command]
+async fn list_local(path: String) -> Result<Vec<Entry>, String> {
+    blocking(move || {
+        let dir = std::fs::read_dir(&path).map_err(|e| format!("cannot open {path}: {e}"))?;
+        let mut out = Vec::new();
+        for item in dir.flatten() {
+            let p = item.path();
+            // Follow symlinks for the type and size, like Finder; broken links show as "other".
+            let meta = std::fs::metadata(&p).or_else(|_| std::fs::symlink_metadata(&p));
+            let Ok(meta) = meta else { continue };
+            let kind = if meta.is_dir() { "dir" } else if meta.is_file() { "file" } else { "other" };
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            out.push(Entry {
+                name: item.file_name().to_string_lossy().into_owned(),
+                path: p.to_string_lossy().into_owned(),
+                kind,
+                size: if meta.is_file() { meta.len() } else { 0 },
+                mtime,
+            });
+        }
+        Ok(out)
+    })
+    .await?
+}
+
+/// Common places on this Mac for the Mac pane's menu: (name, path) pairs that exist.
+#[tauri::command]
+fn local_places(app: AppHandle) -> Vec<(String, String)> {
+    let p = app.path();
+    let mut places: Vec<(String, Option<PathBuf>)> = vec![
+        ("Home".into(), p.home_dir().ok()),
+        ("Desktop".into(), p.desktop_dir().ok()),
+        ("Documents".into(), p.document_dir().ok()),
+        ("Downloads".into(), p.download_dir().ok()),
+        ("Movies".into(), p.video_dir().ok()),
+        ("Music".into(), p.audio_dir().ok()),
+        ("Pictures".into(), p.picture_dir().ok()),
+    ];
+    if let Ok(volumes) = std::fs::read_dir("/Volumes") {
+        for v in volumes.flatten() {
+            let path = v.path();
+            // The startup disk also appears here, as a link to "/".
+            if std::fs::read_link(&path).is_ok() {
+                continue;
+            }
+            places.push((v.file_name().to_string_lossy().into_owned(), Some(path)));
+        }
+    }
+    places
+        .into_iter()
+        .filter_map(|(name, path)| path.filter(|p| p.is_dir()).map(|p| (name, p.display().to_string())))
+        .collect()
+}
+
+#[tauri::command]
+fn local_mkdir(path: String) -> Result<(), String> {
+    std::fs::create_dir(&path).map_err(|e| e.to_string())
+}
+
+/// Renames without ever replacing an existing item.
+#[tauri::command]
+fn local_rename(from: String, to: String) -> Result<(), String> {
+    if std::path::Path::new(&to).exists() {
+        return Err("something with that name already exists".into());
+    }
+    std::fs::rename(&from, &to).map_err(|e| e.to_string())
+}
+
+/// Moves items to the Trash (never deletes them outright).
+#[tauri::command]
+async fn local_trash(paths: Vec<String>) -> Result<(), String> {
+    blocking(move || {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut ctx = trash::TrashContext::default();
+        // NSFileManager avoids asking for permission to control Finder.
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete_all(&paths).map_err(|e| e.to_string())
+    })
+    .await?
+}
+
+/// New folder, rename and delete on the phone, through the engine (which refuses to
+/// delete storage roots and standard folders).
+#[tauri::command]
+async fn phone_op(app: AppHandle, serial: String, op: String, paths: Vec<String>) -> Result<(), String> {
+    let flag = match op.as_str() {
+        "mkdir" => "--mkdir",
+        "rename" => "--rename",
+        "delete" => "--delete",
+        _ => return Err(format!("unknown operation {op}")),
+    };
+    blocking(move || {
+        let mut args = vec!["-s".to_string(), serial, flag.to_string(), "--".to_string()];
+        args.extend(paths);
+        query(&app, args).map(|_| ())
+    })
+    .await?
+}
+
 /// Settings remembered between launches, as JSON in the app's settings folder.
 fn settings_file(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app
@@ -133,25 +274,6 @@ fn save_settings(app: AppHandle, settings: Value) -> Result<(), String> {
     }
     let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     std::fs::write(file, text).map_err(|e| e.to_string())
-}
-
-/// Native picker for files or folders on this computer.
-#[tauri::command]
-async fn pick_local(app: AppHandle, folders: bool, multiple: bool) -> Result<Vec<String>, String> {
-    blocking(move || {
-        let dialog = app.dialog().file();
-        let picked = match (folders, multiple) {
-            (true, true) => dialog.blocking_pick_folders().unwrap_or_default(),
-            (true, false) => dialog.blocking_pick_folder().into_iter().collect(),
-            (false, _) => dialog.blocking_pick_files().unwrap_or_default(),
-        };
-        picked
-            .into_iter()
-            .filter_map(|p| p.into_path().ok())
-            .map(|p| p.display().to_string())
-            .collect()
-    })
-    .await
 }
 
 #[derive(Deserialize)]
@@ -289,35 +411,45 @@ fn autorun() -> Option<Value> {
 
 fn main() {
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .manage(Running::default())
         .manage(Measuring::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::DragDrop(drag) = event {
+                // Positions are sent in CSS pixels so the window can find the pane under them.
+                let scale = window.scale_factor().unwrap_or(1.0);
+                let at = |p: &tauri::PhysicalPosition<f64>| serde_json::json!({ "x": p.x / scale, "y": p.y / scale });
                 match drag {
-                    tauri::DragDropEvent::Enter { .. } => {
-                        let _ = window.emit("drag-hover", true);
+                    tauri::DragDropEvent::Enter { position, .. } | tauri::DragDropEvent::Over { position } => {
+                        let _ = window.emit("drag-hover", serde_json::json!({ "over": true, "at": at(position) }));
                     }
                     tauri::DragDropEvent::Leave => {
-                        let _ = window.emit("drag-hover", false);
+                        let _ = window.emit("drag-hover", serde_json::json!({ "over": false }));
                     }
-                    tauri::DragDropEvent::Drop { paths, .. } => {
-                        let _ = window.emit("drag-hover", false);
+                    tauri::DragDropEvent::Drop { paths, position } => {
+                        let _ = window.emit("drag-hover", serde_json::json!({ "over": false }));
                         let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                        let _ = window.emit("files-dropped", paths);
+                        let _ = window.emit("files-dropped", serde_json::json!({ "paths": paths, "at": at(position) }));
                     }
                     _ => {}
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![
+            adb_status,
+            get_adb,
+            open_adb_terms,
             list_devices,
             list_dir,
+            list_local,
+            local_places,
+            local_mkdir,
+            local_rename,
+            local_trash,
+            phone_op,
             show_profile,
             measure,
             load_settings,
             save_settings,
-            pick_local,
             start_copy,
             cancel_copy,
             autorun

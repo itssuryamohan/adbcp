@@ -1,5 +1,6 @@
-// adbcp window logic. Talks to the Rust side through Tauri commands and turns the copy
-// engine's JSON events ("start", "plan", "progress", ...) into what the window shows.
+// adbcp window: two file panes (this Mac, the phone) and a transfer bar. Copies are run
+// by the adbcp engine through the Rust side; its JSON events ("start", "plan",
+// "progress", ...) drive the transfer bar. See ../SPEC.md.
 'use strict';
 
 const { invoke } = window.__TAURI__.core;
@@ -7,35 +8,48 @@ const { listen } = window.__TAURI__.event;
 const $ = (id) => document.getElementById(id);
 
 const ui = {
-  device: $('device'), refresh: $('refresh'), deviceNote: $('device-note'),
-  addFiles: $('add-files'), addFolder: $('add-folder'), addPhone: $('add-phone'), remove: $('remove'),
-  sources: $('sources'), dest: $('dest'), browse: $('browse'),
-  verify: $('verify'), skip: $('skip'), advanced: $('advanced'),
+  device: $('device'), refresh: $('refresh'), deviceNote: $('device-note'), openSettings: $('open-settings'),
+  summary: $('summary'), bar: $('bar'), stats: $('stats'), result: $('result'), queueInfo: $('queue-info'),
+  retry: $('retry'), safeNames: $('safe-names'), cancel: $('cancel'),
+  problems: $('problems'), problemsTitle: $('problems-title'), problemList: $('problem-list'), log: $('log'),
+  settings: $('settings'), closeSettings: $('close-settings'),
+  verify: $('verify'), conflicts: $('conflicts'), showHidden: $('show-hidden'),
+  tuning: $('tuning'), measure: $('measure'), adbInfo: $('adb-info'),
   streams: $('streams'), compression: $('compression'), split: $('split'),
   partSize: $('part-size'), splitMin: $('split-min'), fixNames: $('fix-names'),
   burst: $('burst'), libusb: $('libusb'), force: $('force'),
-  tuning: $('tuning'), measure: $('measure'), dropHint: $('drop-hint'), safeNames: $('safe-names'),
-  summary: $('summary'), bar: $('bar'), stats: $('stats'), result: $('result'),
-  problems: $('problems'), problemsTitle: $('problems-title'), problemList: $('problem-list'),
-  log: $('log'), start: $('start'), cancel: $('cancel'), retry: $('retry'),
-  browser: $('browser'), up: $('up'), here: $('here'), entries: $('entries'),
-  hiddenFiles: $('hidden-files'), choose: $('choose'), browserCancel: $('browser-cancel'),
+  dialog: $('dialog'), dialogTitle: $('dialog-title'), dialogText: $('dialog-text'), dialogList: $('dialog-list'),
+  dialogInput: $('dialog-input'), dialogError: $('dialog-error'), dialogButtons: $('dialog-buttons'),
+  ghost: $('drag-ghost'),
 };
+
+const PHONE_PLACES = [
+  ['Internal storage', '/sdcard'], ['Download', '/sdcard/Download'], ['DCIM', '/sdcard/DCIM'],
+  ['Pictures', '/sdcard/Pictures'], ['Movies', '/sdcard/Movies'], ['Music', '/sdcard/Music'],
+  ['Documents', '/sdcard/Documents'], ['App folders (Android/data)', '/sdcard/Android/data'],
+  ['App files (Android/obb)', '/sdcard/Android/obb'],
+];
+// Characters Android's shared storage refuses in names.
+const BAD_PHONE_CHARS = /["*:<>?|\\]/;
 
 const state = {
-  direction: 'push',          // 'push': computer to phone, 'pull': phone to computer
-  sources: [],
-  selected: new Set(),
   devices: [],
-  running: false,
-  phoneDest: '/sdcard/Download/',
-  localDest: '',
-  run: null,                  // what the current copy has reported so far
+  running: false,             // a copy is running
   measuring: false,
-  profileKey: '',             // phone + destination kind the shown measurements are for
+  queue: [],                  // copies waiting their turn
+  current: null,              // the copy running now
+  lastJob: null,              // the last copy started (for Retry / safe names)
+  run: null,                  // what the running copy has reported so far
+  profileKey: '',
+  activeSide: 'mac',
+  localPlaces: [],
+  adb: null,                  // the engine's "adb" report: found, path, source, version
+  adbMissing: false,          // no adb, and the user has not agreed to download it
+  adbError: '',
+  autoDownloadAdb: false,     // test hook only
 };
 
-// ------------------------------------------------------------------ formatting ---
+// ---------------------------------------------------------------- formatting ---
 const pad = (n) => String(n).padStart(2, '0');
 function size(n) {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
@@ -55,6 +69,20 @@ function parentOf(p) {
   const i = p.replace(/\/+$/, '').lastIndexOf('/');
   return i <= 0 ? '/' : p.slice(0, i);
 }
+const join = (dir, name) => (dir === '/' ? '' : dir.replace(/\/+$/, '')) + '/' + name;
+const withSlash = (dir) => dir.replace(/\/?$/, '/');
+function normalize(p) {
+  p = p.trim().replace(/\/+/g, '/');
+  return p.length > 1 ? p.replace(/\/$/, '') : p || '/';
+}
+function dateText(sec) {
+  if (!sec) return '';
+  const d = new Date(sec * 1000), now = new Date();
+  const day = d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+  return d.getFullYear() === now.getFullYear()
+    ? `${day} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+    : `${day} ${d.getFullYear()}`;
+}
 function el(tag, cls, text) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -67,8 +95,121 @@ function log(line) {
   if (lines.length > 600) ui.log.textContent = lines.slice(-500).join('\n');
   ui.log.scrollTop = ui.log.scrollHeight;
 }
+function showResult(text, ok) {
+  ui.result.textContent = text;
+  ui.result.className = ok === undefined ? '' : ok ? 'ok' : 'bad';
+}
 
-// --------------------------------------------------------------------- phones ---
+// ------------------------------------------------------------------- dialogs ---
+// dialog({ title, text, list, input, validate, buttons }) resolves with
+// { button, value }. Enter presses the primary button, Esc presses "cancel".
+let dialogKey = null;
+function dialog({ title, text = '', list = [], input = null, validate = null, buttons }) {
+  return new Promise((resolve) => {
+    ui.dialogTitle.textContent = title;
+    ui.dialogText.textContent = text;
+    ui.dialogList.innerHTML = '';
+    for (const item of list.slice(0, 12)) ui.dialogList.append(el('li', '', item));
+    if (list.length > 12) ui.dialogList.append(el('li', '', `… and ${num(list.length - 12)} more`));
+    ui.dialogError.textContent = '';
+    ui.dialogInput.hidden = input === null;
+    ui.dialogInput.value = input ?? '';
+    ui.dialogButtons.innerHTML = '';
+    const finish = (id) => {
+      const value = ui.dialogInput.value;
+      if (id !== 'cancel' && validate) {
+        const problem = validate(value);
+        if (problem) { ui.dialogError.textContent = problem; return; }
+      }
+      ui.dialog.hidden = true;
+      dialogKey = null;
+      resolve({ button: id, value });
+    };
+    for (const b of buttons) {
+      const btn = el('button', b.style || '', b.label);
+      btn.addEventListener('click', () => finish(b.id));
+      ui.dialogButtons.append(btn);
+    }
+    dialogKey = (key) => {
+      if (key === 'Escape') finish('cancel');
+      else if (key === 'Enter') { const p = buttons.find((b) => b.primary); if (p) finish(p.id); }
+    };
+    ui.dialog.hidden = false;
+    if (input !== null) {
+      ui.dialogInput.focus();
+      const dot = ui.dialogInput.value.lastIndexOf('.');
+      ui.dialogInput.setSelectionRange(0, dot > 0 ? dot : ui.dialogInput.value.length);
+    }
+  });
+}
+
+// ----------------------------------------------------------------------- adb ---
+// Google's adb is not bundled with the app. The engine finds an installed one (PATH,
+// Homebrew, Android Studio); otherwise the window asks before downloading it.
+const ADB_SOURCES = {
+  environment: 'set with ADB', bundled: 'next to the engine', path: 'from PATH', homebrew: 'Homebrew',
+  'android-sdk': 'Android Studio SDK', downloaded: 'downloaded by adbcp',
+};
+async function adbStatus() {
+  try { return (await invoke('adb_status')).find((e) => e.event === 'adb') || { found: false }; }
+  catch (err) { return { found: false }; }
+}
+function showAdbInfo() {
+  const a = state.adb;
+  ui.adbInfo.textContent = a && a.found
+    ? `Google platform-tools ${a.version || ''} · ${ADB_SOURCES[a.source] || a.source} · ${a.path}`
+    : 'Not installed. adbcp asks before downloading it from Google.';
+}
+function setPhoneMessage(text) {
+  const pane = panes.phone;
+  pane.path$.value = pane.path;
+  pane.message = text;
+  pane.entries = [];
+  pane.selected.clear();
+  renderPane(pane);
+}
+
+// True when adb is available, asking to download it if needed.
+async function ensureAdb() {
+  let a = await adbStatus();
+  while (!a.found) {
+    let choice = state.autoDownloadAdb ? 'download' : null;
+    if (!choice) {
+      ({ button: choice } = await dialog({
+        title: 'adbcp needs Google’s adb',
+        text: 'adbcp reaches the phone through adb, part of Google’s Android SDK Platform-Tools. ' +
+          'It is not included with adbcp, and none was found on this Mac.\n\n' +
+          'Download it now from Google? It is about 16 MB, downloaded once, and its signature is checked. ' +
+          'By downloading it you agree to Google’s terms for the Platform-Tools.',
+        buttons: [{ id: 'cancel', label: 'Not now' }, { id: 'terms', label: 'Google’s terms…' },
+          { id: 'download', label: 'Download', style: 'primary', primary: true }],
+      }));
+    }
+    if (choice === 'terms') { invoke('open_adb_terms').catch((e) => log(`adbcp: ${e}`)); continue; }
+    if (choice !== 'download') {
+      state.adb = a; state.adbMissing = true; state.adbError = '';
+      showAdbInfo();
+      return false;
+    }
+    state.autoDownloadAdb = false;
+    setPhoneMessage('Downloading adb from Google (about 16 MB, once)…');
+    ui.device.innerHTML = '';
+    ui.device.append(el('option', '', 'Downloading adb…'));
+    try {
+      a = (await invoke('get_adb')).find((e) => e.event === 'adb') || { found: false };
+      if (!a.found) throw new Error('the download did not produce a usable adb');
+    } catch (err) {
+      state.adb = { found: false }; state.adbMissing = true; state.adbError = String(err);
+      showAdbInfo();
+      return false;
+    }
+  }
+  state.adb = a; state.adbMissing = false; state.adbError = '';
+  showAdbInfo();
+  return true;
+}
+
+// -------------------------------------------------------------------- phones ---
 function deviceLabel(d) {
   const name = d.model || d.serial;
   if (d.state === 'unauthorized') return `${name} · allow this computer on the phone`;
@@ -77,15 +218,23 @@ function deviceLabel(d) {
   if (!d.link_mbps) return `${name} · USB`;
   return `${name} · USB ${d.link_mbps >= 1000 ? d.link_mbps / 1000 + ' Gb/s' : d.link_mbps + ' Mb/s'}`;
 }
+function currentDevice() {
+  return state.devices.find((d) => d.serial === ui.device.value && d.state === 'device');
+}
 
 async function refreshDevices() {
+  const before = currentDevice()?.serial;
+  if (!(state.adb && state.adb.found) && !(await ensureAdb())) {
+    state.devices = [];
+    ui.device.innerHTML = '';
+    ui.device.append(el('option', '', 'adb is not installed'));
+    updateControls();
+    await loadPane(panes.phone, panes.phone.path);
+    return;
+  }
   ui.device.innerHTML = '';
   let devices = [];
-  try {
-    devices = await invoke('list_devices');
-  } catch (err) {
-    log(`adbcp: ${err}`);
-  }
+  try { devices = await invoke('list_devices'); } catch (err) { log(`adbcp: ${err}`); }
   state.devices = devices;
   for (const d of devices) {
     const o = el('option', '', deviceLabel(d));
@@ -93,302 +242,346 @@ async function refreshDevices() {
     o.disabled = d.state !== 'device';
     ui.device.append(o);
   }
-  const ready = devices.find((d) => d.state === 'device');
+  const ready = devices.find((d) => d.serial === before && d.state === 'device') || devices.find((d) => d.state === 'device');
   if (ready) ui.device.value = ready.serial;
   if (!devices.length) ui.device.append(el('option', '', 'No phone found'));
-  showDeviceNote();
-  updateControls();
-  await refreshTuning(true);
-}
-
-function currentDevice() {
-  return state.devices.find((d) => d.serial === ui.device.value && d.state === 'device');
-}
-
-function showDeviceNote() {
   const d = currentDevice();
-  let text = '';
-  if (!state.devices.length) {
-    text = 'No phone found. Connect it with a USB cable, turn on USB debugging (Settings › Developer options), and allow this computer when the phone asks. Then press Refresh.';
-  } else if (!d) {
-    text = 'Unlock the phone and allow this computer when it asks, then press Refresh.';
-  } else if (d.connection === 'usb' && d.link_mbps && d.link_mbps < 5000) {
-    text = `The phone is connected at USB 2.0 speed (${d.link_mbps} Mb/s), about 40 MB/s at best. A USB 3 data cable and port can be 5–10 times faster.`;
-  }
-  ui.deviceNote.textContent = text;
-  ui.deviceNote.hidden = !text;
-}
-
-// -------------------------------------------------------------------- sources ---
-function renderSources() {
-  ui.sources.innerHTML = '';
-  if (!state.sources.length) {
-    ui.sources.append(el('li', 'empty', state.direction === 'push'
-      ? 'Drop files or folders here, or use Add files… / Add folder…'
-      : 'Use Add from phone… to choose what to copy from the phone.'));
-  }
-  for (const p of state.sources) {
-    const li = el('li', state.selected.has(p) ? 'selected' : '');
-    li.append(el('span', 'name', basename(p)), el('span', 'path', p));
-    li.addEventListener('click', () => {
-      if (state.running) return;
-      state.selected.has(p) ? state.selected.delete(p) : state.selected.add(p);
-      renderSources();
-    });
-    ui.sources.append(li);
-  }
+  ui.deviceNote.textContent = d && d.connection === 'usb' && d.link_mbps && d.link_mbps < 5000
+    ? `USB 2.0 speed (${d.link_mbps} Mb/s): a USB 3 cable and port can be 5–10× faster.` : '';
   updateControls();
+  await loadPane(panes.phone, panes.phone.path);
 }
 
-function addSources(paths) {
-  for (const p of paths) if (p && !state.sources.includes(p)) state.sources.push(p);
-  renderSources();
-}
-
-async function setDirection(dir) {
-  if (dir === state.direction) return;
-  if (state.direction === 'push') state.phoneDest = ui.dest.value; else state.localDest = ui.dest.value;
-  state.direction = dir;
-  state.sources = [];
-  state.selected.clear();
-  if (dir === 'pull' && !state.localDest) {
-    try { state.localDest = (await window.__TAURI__.path.downloadDir()).replace(/\/?$/, '/'); } catch (_) { state.localDest = ''; }
-  }
-  ui.dest.value = dir === 'push' ? state.phoneDest : state.localDest;
-  ui.addFiles.hidden = ui.addFolder.hidden = dir !== 'push';
-  ui.addPhone.hidden = dir !== 'pull';
-  renderSources();
-  refreshTuning();
-  saveSettingsSoon();
-}
-
-// ------------------------------------------------------------ phone browser ---
-const browser = { mode: 'add', path: '/sdcard', checked: new Set(), entries: [] };
-
-async function openBrowser(mode, start) {
-  if (!currentDevice()) return;
-  browser.mode = mode;
-  browser.checked.clear();
-  ui.browser.hidden = false;
-  await browse(start || '/sdcard');
-}
-function closeBrowser() { ui.browser.hidden = true; }
-
-async function browse(path) {
-  path = path.replace(/\/+/g, '/').replace(/(.)\/$/, '$1') || '/';
-  ui.here.textContent = path;
-  ui.entries.innerHTML = '';
-  ui.entries.append(el('li', 'empty', 'Loading…'));
-  let entries;
-  try {
-    entries = await invoke('list_dir', { serial: ui.device.value, path });
-  } catch (err) {
-    ui.entries.innerHTML = '';
-    ui.entries.append(el('li', 'empty', String(err)));
-    return;
-  }
-  browser.path = path;
-  browser.entries = entries;
-  renderBrowser();
-}
-
-function renderBrowser() {
-  const shown = browser.entries
-    .filter((e) => ui.hiddenFiles.checked || !e.name.startsWith('.'))
-    .sort((a, b) => (a.type === 'dir') === (b.type === 'dir')
-      ? a.name.localeCompare(b.name, undefined, { numeric: true })
-      : (a.type === 'dir' ? -1 : 1));
-  ui.entries.innerHTML = '';
-  if (!shown.length) ui.entries.append(el('li', 'empty', 'This folder is empty.'));
-  for (const e of shown) {
-    const li = el('li', e.type === 'dir' ? 'dir' : 'file');
-    if (browser.mode === 'add') {
-      const box = el('input');
-      box.type = 'checkbox';
-      box.checked = browser.checked.has(e.path);
-      box.addEventListener('change', () => {
-        box.checked ? browser.checked.add(e.path) : browser.checked.delete(e.path);
-        updateChoose();
-      });
-      li.append(box);
-    } else if (e.type !== 'dir') {
-      li.classList.add('off');
-    }
-    const name = el('span', 'name', e.name);
-    if (e.type === 'dir') name.addEventListener('click', () => browse(e.path));
-    li.append(name);
-    if (e.type !== 'dir') li.append(el('span', 'size', size(e.size)));
-    ui.entries.append(li);
-  }
-  updateChoose();
-}
-
-function updateChoose() {
-  if (browser.mode === 'dest') {
-    ui.choose.textContent = 'Choose this folder';
-    ui.choose.disabled = false;
-  } else {
-    ui.choose.textContent = browser.checked.size ? `Add ${plural(browser.checked.size, 'item')}` : 'Add selected';
-    ui.choose.disabled = !browser.checked.size;
-  }
-}
-
-// -------------------------------------------------------------------- tuning ---
-// The engine keeps measurements per phone, connection and kind of destination.
-function destKind(path) {
-  if (/\/Android\/(data|obb)(\/|$)/.test(path)) return 'appdir';
-  if (/^\/data\//.test(path)) return 'data';
-  return 'media';
-}
-const KIND_NAMES = { media: 'shared storage', appdir: 'app folders', data: '/data' };
-function tuningDest() {
-  const d = ui.dest.value.trim();
-  return d.startsWith('/') ? d : '/sdcard/Download/';
-}
-const numbersAt = (pairs) => Object.values(pairs || {}).join(' · ');
-
-function showTuning(text, cls = '', title = '') {
-  ui.tuning.textContent = text;
-  ui.tuning.className = `grow small ${cls}`;
-  ui.tuning.title = title;
-}
-
-async function refreshTuning(force = false) {
-  const d = currentDevice();
-  if (state.measuring) return;
-  if (!d) { state.profileKey = ''; showTuning('—'); return; }
-  if (state.direction === 'pull') {
-    state.profileKey = '';
-    showTuning('Copies from the phone use fixed settings: 8 parallel transfers, small files in groups on 4.');
-    return;
-  }
-  const key = `${d.serial}|${destKind(tuningDest())}`;
-  if (!force && key === state.profileKey) return;
-  state.profileKey = key;
-  try {
-    const p = (await invoke('show_profile', { serial: d.serial, dest: tuningDest() })).find((e) => e.event === 'profile');
-    if (p) describeProfile(p);
-  } catch (err) {
-    showTuning(String(err), 'bad');
-  }
-}
-
-function describeProfile(p) {
-  const where = KIND_NAMES[p.kind] || p.kind;
-  if (!p.saved) {
-    showTuning(`Not measured yet for this phone and ${where}. It is measured automatically before the first large copy (about 10 seconds), or now.`);
-    return;
-  }
-  const detail = `Large files: ${numbersAt(p.large_mib_per_second)} MiB/s on 2 · 4 · 8 transfers. ` +
-    `Small files: ${numbersAt(p.small_files_per_second)} files/s on 2 · 4 · 8 transfers.`;
-  showTuning(`Measured ${p.date} for ${where}: ${plural(p.streams, 'parallel transfer')} for large files, ` +
-    `up to ${p.small_streams} for small files.`, '', detail);
-}
-
-async function measureNow() {
-  const d = currentDevice();
-  if (!d || state.running || state.measuring) return;
-  state.measuring = true;
-  updateControls();
-  showTuning('Measuring this phone, cable and destination (about 10 seconds)…', 'busy');
-  try {
-    const events = await invoke('measure', { serial: d.serial, dest: tuningDest() });
-    const p = events.find((e) => e.event === 'profile');
-    state.measuring = false;
-    if (p) { describeProfile(p); state.profileKey = `${d.serial}|${p.kind}`; }
-  } catch (err) {
-    state.measuring = false;
-    showTuning(`Measuring failed: ${err}`, 'bad');
-  }
-  updateControls();
-}
-
-// ------------------------------------------------------------------ settings ---
-// Remembered between launches. Per-copy choices (what to copy, skip, free-space check)
-// are deliberately not remembered.
-function collectSettings() {
-  if (state.direction === 'push') state.phoneDest = ui.dest.value; else state.localDest = ui.dest.value;
+// --------------------------------------------------------------------- panes ---
+function makePane(side) {
+  const root = $(`pane-${side}`);
+  const q = (s) => root.querySelector(s);
   return {
-    direction: state.direction, phoneDest: state.phoneDest, localDest: state.localDest,
-    verify: ui.verify.checked, streams: ui.streams.value, compression: ui.compression.value,
-    split: ui.split.value, partSize: ui.partSize.value, splitMin: ui.splitMin.value,
-    fixNames: ui.fixNames.checked, burst: ui.burst.checked, libusb: ui.libusb.checked,
-    advancedOpen: ui.advanced.open,
+    side, root,
+    list: q('.entries'), path$: q('.path'), places: q('.places'), up: q('.up'), reload: q('.reload'),
+    mkdir: q('.mkdir'), rename: q('.rename'), del: q('.delete'), copy: q('.copy'),
+    selInfo: q('.sel-info'), hint: q('.drop-hint'), heads: [...root.querySelectorAll('.list-head button')],
+    path: '', entries: [], shown: [], selected: new Set(), anchor: -1,
+    sort: { key: 'name', dir: 1 }, message: '', loadSeq: 0,
   };
 }
-async function applySettings(s) {
-  if (!s || typeof s !== 'object') return;
-  const set = (select, v) => { if (v != null && [...select.options].some((o) => o.value === String(v))) select.value = String(v); };
-  if (typeof s.phoneDest === 'string' && s.phoneDest) state.phoneDest = s.phoneDest;
-  if (typeof s.localDest === 'string') state.localDest = s.localDest;
-  ui.dest.value = state.phoneDest;
-  if (typeof s.verify === 'boolean') ui.verify.checked = s.verify;
-  set(ui.streams, s.streams); set(ui.compression, s.compression); set(ui.split, s.split);
-  set(ui.partSize, s.partSize); set(ui.splitMin, s.splitMin);
-  for (const k of ['fixNames', 'burst', 'libusb']) if (typeof s[k] === 'boolean') ui[k].checked = s[k];
-  ui.advanced.open = !!s.advancedOpen;
-  if (s.direction === 'pull') {
-    document.querySelector('input[value="pull"]').checked = true;
-    await setDirection('pull');
-  }
-}
-let saveTimer = null;
-function saveSettingsSoon() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => invoke('save_settings', { settings: collectSettings() }).catch((e) => log(`adbcp: ${e}`)), 300);
+const panes = { mac: makePane('mac'), phone: makePane('phone') };
+const other = (side) => (side === 'mac' ? 'phone' : 'mac');
+
+async function listFolder(side, path) {
+  if (side === 'mac') return invoke('list_local', { path });
+  const d = currentDevice();
+  if (!d) throw new Error('no phone');
+  return invoke('list_dir', { serial: d.serial, path });
 }
 
-// ---------------------------------------------------------------------- copy ---
-function updateControls() {
-  const busy = state.running;
-  const locked = busy || state.measuring;
-  for (const c of [ui.device, ui.refresh, ui.addFiles, ui.addFolder, ui.addPhone, ui.dest, ui.browse,
-    ui.verify, ui.skip, ui.streams, ui.compression, ui.split, ui.partSize, ui.splitMin,
-    ui.fixNames, ui.burst, ui.libusb, ui.force]) c.disabled = locked;
-  ui.partSize.disabled = ui.splitMin.disabled = locked || ui.split.value !== '1';
-  ui.measure.hidden = state.direction !== 'push';
-  ui.measure.disabled = locked || !currentDevice();
-  for (const r of document.querySelectorAll('input[name="direction"]')) r.disabled = busy;
-  ui.addPhone.disabled = busy || !currentDevice();
-  ui.browse.disabled = busy || (state.direction === 'push' && !currentDevice());
-  ui.remove.disabled = busy || !state.selected.size;
-  ui.start.disabled = locked || !currentDevice() || !state.sources.length || !ui.dest.value.trim();
-  ui.cancel.disabled = !busy;
+async function loadPane(pane, path, { keepSelection = false } = {}) {
+  path = normalize(path || '/');
+  const seq = ++pane.loadSeq;
+  pane.path$.value = path;
+  if (pane.side === 'phone' && !currentDevice()) {
+    pane.path = path;
+    pane.entries = [];
+    pane.message = state.adbMissing
+      ? (state.adbError ? `Downloading adb failed: ${state.adbError}\n\n` : '') +
+        'adbcp needs Google’s adb to reach the phone.\nPress Refresh to download it from Google, or install it yourself (for example with Homebrew: brew install android-platform-tools) and press Refresh.'
+      : state.devices.length
+        ? 'The phone is not ready.\nUnlock it and allow this computer when it asks, then press Refresh.'
+        : 'No phone found.\nConnect it with a USB cable, turn on USB debugging (Settings › Developer options), allow this computer when the phone asks, then press Refresh.';
+    pane.selected.clear();
+    renderPane(pane);
+    return;
+  }
+  let entries;
+  try {
+    entries = await listFolder(pane.side, path);
+  } catch (err) {
+    if (seq !== pane.loadSeq) return;
+    pane.message = `Cannot open ${path}:\n${err}`;
+    pane.entries = [];
+    pane.path = path;
+    pane.selected.clear();
+    renderPane(pane, true);
+    return;
+  }
+  if (seq !== pane.loadSeq) return;     // a newer folder was opened meanwhile
+  if (path !== pane.path || !keepSelection) pane.selected.clear();
+  pane.path = path;
+  pane.message = '';
+  pane.entries = entries;
+  for (const p of [...pane.selected]) if (!entries.some((e) => e.path === p)) pane.selected.delete(p);
+  renderPane(pane);
+  saveSettingsSoon();
+  if (pane.side === 'phone') refreshTuning();
+}
+
+function sortedEntries(pane) {
+  const { key, dir } = pane.sort;
+  return pane.entries
+    .filter((e) => ui.showHidden.checked || !e.name.startsWith('.'))
+    .sort((a, b) => {
+      const da = a.type === 'dir', db = b.type === 'dir';
+      if (da !== db) return da ? -1 : 1;
+      let c = key === 'name' ? 0 : (a[key] || 0) - (b[key] || 0);
+      if (c === 0) c = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+      return c * dir;
+    });
+}
+
+function renderPane(pane, isError = false) {
+  pane.shown = sortedEntries(pane);
+  const frag = document.createDocumentFragment();
+  if (pane.message) {
+    frag.append(el('li', `message${isError ? ' bad' : ''}`, pane.message));
+  } else if (!pane.shown.length) {
+    frag.append(el('li', 'message', 'This folder is empty.'));
+  }
+  pane.shown.forEach((e, i) => {
+    const li = el('li', `row ${e.type}${pane.selected.has(e.path) ? ' selected' : ''}`);
+    li.dataset.index = i;
+    li.append(el('span', 'name', e.name), el('span', 'size', e.type === 'file' ? size(e.size) : '—'), el('span', 'date', dateText(e.mtime)));
+    frag.append(li);
+  });
+  pane.list.innerHTML = '';
+  pane.list.append(frag);
+  for (const h of pane.heads) {
+    h.classList.toggle('sorted', h.dataset.sort === pane.sort.key);
+    h.classList.toggle('desc', h.dataset.sort === pane.sort.key && pane.sort.dir < 0);
+  }
+  updatePaneControls(pane);
+}
+
+function renderSelection(pane) {
+  for (const li of pane.list.querySelectorAll('li.row')) {
+    li.classList.toggle('selected', pane.selected.has(pane.shown[li.dataset.index].path));
+  }
+  updatePaneControls(pane);
+}
+
+function selectedEntries(pane) {
+  return pane.shown.filter((e) => pane.selected.has(e.path));
+}
+
+function updatePaneControls(pane) {
+  const sel = selectedEntries(pane);
+  const files = sel.filter((e) => e.type === 'file');
+  const bytes = files.reduce((s, e) => s + e.size, 0);
+  pane.selInfo.textContent = sel.length
+    ? `${plural(sel.length, 'item')} selected${files.length ? ` · ${size(bytes)}` : ''}`
+    : pane.message ? '' : plural(pane.shown.length, 'item');
+  const ready = pane.side === 'mac' || !!currentDevice();
+  const fileOpsOk = ready && !state.running && !state.measuring && !pane.message;
+  pane.mkdir.disabled = !fileOpsOk;
+  pane.rename.disabled = !fileOpsOk || sel.length !== 1;
+  pane.del.disabled = !fileOpsOk || !sel.length;
+  pane.up.disabled = !ready || pane.path === '/';
+  pane.reload.disabled = pane.path$.disabled = pane.places.disabled = !ready;
+  pane.copy.disabled = !sel.length || !currentDevice() || state.measuring;
+}
+
+function setActive(side) {
+  state.activeSide = side;
+  panes.mac.root.classList.toggle('active', side === 'mac');
+  panes.phone.root.classList.toggle('active', side === 'phone');
+}
+
+function openEntry(pane, e) {
+  if (e.type === 'dir') loadPane(pane, e.path);
+}
+
+function clickRow(pane, index, ev) {
+  const e = pane.shown[index];
+  if (!e) return;
+  if (ev.shiftKey && pane.anchor >= 0) {
+    const [a, b] = [Math.min(pane.anchor, index), Math.max(pane.anchor, index)];
+    if (!ev.metaKey) pane.selected.clear();
+    for (let i = a; i <= b; i++) pane.selected.add(pane.shown[i].path);
+  } else if (ev.metaKey) {
+    pane.selected.has(e.path) ? pane.selected.delete(e.path) : pane.selected.add(e.path);
+    pane.anchor = index;
+  } else {
+    pane.selected.clear();
+    pane.selected.add(e.path);
+    pane.anchor = index;
+  }
+  renderSelection(pane);
+}
+
+function fillPlaces(pane, places) {
+  pane.places.innerHTML = '';
+  const head = el('option', '', 'Places');
+  head.value = '';
+  pane.places.append(head);
+  for (const [name, path] of places) {
+    const o = el('option', '', name);
+    o.value = path;
+    pane.places.append(o);
+  }
+}
+
+// ----------------------------------------------------------- file operations ---
+function nameProblem(side, dir, name) {
+  if (!name.trim()) return 'Enter a name.';
+  if (name.includes('/')) return 'Names cannot contain /.';
+  if (name.trim() === '.' || name.trim() === '..') return 'That name is not allowed.';
+  if (side === 'phone' && destKind(dir) === 'media' && BAD_PHONE_CHARS.test(name)) {
+    return 'The phone does not allow these characters in names: " * : < > ? | \\';
+  }
+  return '';
+}
+
+async function newFolder(pane) {
+  if (pane.mkdir.disabled) return;
+  const { button, value } = await dialog({
+    title: 'New folder', text: `In ${pane.path}`, input: 'New folder',
+    validate: (v) => nameProblem(pane.side, pane.path, v) ||
+      (pane.entries.some((e) => e.name === v.trim()) ? 'Something with that name already exists here.' : ''),
+    buttons: [{ id: 'cancel', label: 'Cancel' }, { id: 'ok', label: 'Create', style: 'primary', primary: true }],
+  });
+  if (button !== 'ok') return;
+  const path = join(pane.path, value.trim());
+  try {
+    if (pane.side === 'mac') await invoke('local_mkdir', { path });
+    else await invoke('phone_op', { serial: currentDevice().serial, op: 'mkdir', paths: [path] });
+    await loadPane(pane, pane.path);
+    pane.selected = new Set([path]);
+    renderSelection(pane);
+  } catch (err) {
+    showResult(`Could not create the folder: ${err}`, false);
+  }
+}
+
+async function renameItem(pane) {
+  if (pane.rename.disabled) return;
+  const [e] = selectedEntries(pane);
+  const { button, value } = await dialog({
+    title: `Rename “${e.name}”`, input: e.name,
+    validate: (v) => nameProblem(pane.side, pane.path, v) ||
+      (v.trim() !== e.name && pane.entries.some((x) => x.name === v.trim()) ? 'Something with that name already exists here.' : ''),
+    buttons: [{ id: 'cancel', label: 'Cancel' }, { id: 'ok', label: 'Rename', style: 'primary', primary: true }],
+  });
+  if (button !== 'ok' || value.trim() === e.name) return;
+  const to = join(pane.path, value.trim());
+  try {
+    if (pane.side === 'mac') await invoke('local_rename', { from: e.path, to });
+    else await invoke('phone_op', { serial: currentDevice().serial, op: 'rename', paths: [e.path, to] });
+    await loadPane(pane, pane.path);
+    pane.selected = new Set([to]);
+    renderSelection(pane);
+  } catch (err) {
+    showResult(`Could not rename: ${err}`, false);
+  }
+}
+
+async function deleteItems(pane) {
+  if (pane.del.disabled) return;
+  const sel = selectedEntries(pane);
+  const names = sel.map((e) => e.name + (e.type === 'dir' ? '/' : ''));
+  const phone = pane.side === 'phone';
+  const { button } = await dialog({
+    title: phone ? `Delete ${plural(sel.length, 'item')} from the phone?` : `Move ${plural(sel.length, 'item')} to the Trash?`,
+    text: phone ? 'This cannot be undone: the phone has no trash for adb. Folders are deleted with everything inside.'
+      : 'You can put them back from the Trash.',
+    list: names,
+    buttons: [{ id: 'cancel', label: 'Cancel', primary: true },
+      { id: 'ok', label: phone ? 'Delete' : 'Move to Trash', style: phone ? 'danger' : 'primary' }],
+  });
+  if (button !== 'ok') return;
+  try {
+    const paths = sel.map((e) => e.path);
+    if (phone) await invoke('phone_op', { serial: currentDevice().serial, op: 'delete', paths });
+    else await invoke('local_trash', { paths });
+    showResult(phone ? `Deleted ${plural(sel.length, 'item')} from the phone.` : `Moved ${plural(sel.length, 'item')} to the Trash.`);
+  } catch (err) {
+    showResult(`Could not delete: ${err}`, false);
+  }
+  await loadPane(pane, pane.path);
+}
+
+// ------------------------------------------------------------------- copying ---
+async function namesIn(side, dir) {
+  const pane = panes[side];
+  if (normalize(dir) === pane.path && !pane.message) return new Set(pane.entries.map((e) => e.name));
+  try { return new Set((await listFolder(side, dir)).map((e) => e.name)); } catch (_) { return new Set(); }
+}
+
+// Copies `sources` (on side `from`) into folder `destDir` on the other side.
+async function copyItems(from, sources, destDir) {
+  if (!sources.length) return;
+  if (!currentDevice()) { showResult('Connect a phone first.', false); return; }
+  const to = other(from);
+  destDir = normalize(destDir);
+  const existing = await namesIn(to, destDir);
+  const clashes = sources.map(basename).filter((n) => existing.has(n));
+  let skipExisting = false;
+  if (clashes.length) {
+    let choice = ui.conflicts.value;
+    if (choice === 'ask') {
+      const { button } = await dialog({
+        title: `${plural(clashes.length, 'item')} already ${clashes.length === 1 ? 'exists' : 'exist'} in ${basename(destDir) || destDir}`,
+        text: 'Replace overwrites them. Skip existing leaves files that are already there with the same size and copies the rest.',
+        list: clashes,
+        buttons: [{ id: 'cancel', label: 'Cancel' }, { id: 'skip', label: 'Skip existing' },
+          { id: 'replace', label: 'Replace', style: 'primary', primary: true }],
+      });
+      if (button === 'cancel') return;
+      choice = button;
+    }
+    skipExisting = choice === 'skip';
+  }
+  const where = to === 'phone' ? 'the phone' : 'this Mac';
+  enqueue({
+    pull: from === 'phone', sources, dest: withSlash(destDir), destSide: to, skipExisting, fixNames: false,
+    label: `Copying ${sources.length === 1 ? `“${basename(sources[0])}”` : plural(sources.length, 'item')} to ${destDir} on ${where}`,
+  });
+}
+
+function copySelection(from) {
+  const pane = panes[from];
+  copyItems(from, selectedEntries(pane).map((e) => e.path), panes[other(from)].path);
+}
+
+function enqueue(job) {
+  state.queue.push(job);
+  renderQueueInfo();
+  startNext();
+}
+
+function renderQueueInfo() {
+  ui.queueInfo.textContent = state.queue.length ? `${plural(state.queue.length, 'copy')} waiting` : '';
 }
 
 function resetStatus() {
   state.run = { problems: 0, nameProblems: 0, otherProblems: 0, renamed: 0, done: null, verify: null, error: null };
-  ui.summary.textContent = '';
-  ui.result.textContent = '';
-  ui.result.className = '';
+  showResult('');
   ui.bar.style.width = '0';
   ui.bar.classList.remove('busy');
   ui.problemList.innerHTML = '';
   ui.problems.hidden = true;
-  ui.retry.hidden = true;
-  ui.safeNames.hidden = true;
+  ui.retry.hidden = ui.safeNames.hidden = true;
   ui.log.textContent = '';
 }
 
-async function startCopy(overrides = {}) {
-  const pull = state.direction === 'pull';
-  const dest = ui.dest.value.trim();
-  if (!pull && !dest.startsWith('/')) {
-    ui.result.textContent = 'The destination on the phone must start with /, for example /sdcard/Download/.';
-    ui.result.className = 'bad';
-    return;
-  }
+async function startNext() {
+  if (state.running || state.measuring) return;
+  const job = state.queue.shift();
+  renderQueueInfo();
+  if (!job) return;
+  const d = currentDevice();
+  if (!d) { state.queue = []; renderQueueInfo(); showResult('The phone is no longer connected.', false); return; }
+  state.current = state.lastJob = job;
   resetStatus();
-  ui.stats.textContent = 'Starting…';
   state.running = true;
   updateControls();
+  ui.summary.textContent = job.label;
+  ui.stats.textContent = 'Starting…';
   const req = {
-    serial: ui.device.value,
-    pull,
-    sources: state.sources,
-    dest,
+    serial: d.serial,
+    pull: job.pull,
+    sources: job.sources,
+    dest: job.dest,
     verify: ui.verify.checked,
-    skipExisting: overrides.skipExisting ?? ui.skip.checked,
+    skipExisting: job.skipExisting,
     streams: ui.streams.value ? Number(ui.streams.value) : null,
     compression: ui.compression.value,
     split: ui.split.value === '1',
@@ -396,20 +589,20 @@ async function startCopy(overrides = {}) {
     // the engine would switch it off by itself (USB 2.0).
     partSizeMib: ui.partSize.value !== '128' ? Number(ui.partSize.value) : null,
     splitMinMib: ui.splitMin.value !== '256' ? Number(ui.splitMin.value) : null,
-    fixNames: !pull && (overrides.fixNames ?? ui.fixNames.checked),
+    fixNames: !job.pull && (job.fixNames || ui.fixNames.checked),
     burst: ui.burst.checked,
     libusb: ui.libusb.checked,
     force: ui.force.checked,
   };
-  saveSettingsSoon();
   try {
     await invoke('start_copy', { req });
   } catch (err) {
     state.running = false;
+    state.current = null;
     ui.stats.textContent = 'Ready.';
-    ui.result.textContent = String(err);
-    ui.result.className = 'bad';
+    showResult(String(err), false);
     updateControls();
+    startNext();
   }
 }
 
@@ -442,9 +635,10 @@ const VERIFY_PROBLEMS = {
 
 function onEvent(e) {
   const r = state.run;
+  if (!r) return;
   switch (e.event) {
     case 'start':
-      ui.summary.textContent = `${plural(e.files, 'file')}, ${size(e.bytes)} → ${e.destination}`;
+      ui.summary.textContent = `${state.current?.label || 'Copying'} · ${plural(e.files, 'file')}, ${size(e.bytes)}`;
       break;
     case 'skip':
       log(`Skipping ${plural(e.files, 'file')} already there.`);
@@ -503,128 +697,358 @@ function onEvent(e) {
 
 function onExit(code) {
   const r = state.run || {};
+  const job = state.current;
   state.running = false;
+  state.current = null;
   ui.bar.classList.remove('busy');
   let text, ok = false;
   if (code === 130) {
-    text = 'Cancelled. Files that finished copying are kept; partly copied files were removed. Turn on “Skip files already there” and press Start to continue.';
-    ui.skip.checked = true;
+    text = 'Cancelled. Files that finished copying are kept; partly copied files were removed.';
   } else if (code === 0) {
     ok = true;
     text = r.done ? `Done: ${plural(r.done.files_copied, 'file')} copied.` : 'Done.';
     if (r.verify) text += ` All ${plural(r.verify.files, 'file')} verified.`;
     if (r.renamed) text += ` ${plural(r.renamed, 'file')} got safe names (see Details).`;
   } else if (r.done || r.verify) {
-    // Files with names the phone does not allow are reported, never retried as they are:
+    // Names the phone does not allow are reported, never retried as they are:
     // "Copy with safe names" copies just those, with the characters replaced.
     const parts = [];
     if (r.otherProblems) parts.push(`${plural(r.otherProblems, 'file')} could not be copied or failed verification.`);
     if (r.nameProblems) parts.push(`${plural(r.nameProblems, 'file')} ${r.nameProblems === 1 ? 'has a name' : 'have names'} the phone does not allow.`);
-    text = parts.join(' ') + ' See Problems below.';
+    text = parts.join(' ') + ' See Problems.';
     ui.retry.hidden = !r.otherProblems;
     ui.safeNames.hidden = !r.nameProblems;
   } else {
     text = r.error || `The copy stopped unexpectedly (code ${code}). See Details.`;
+    $('details').open = true;
   }
-  ui.result.textContent = text;
-  ui.result.className = ok ? 'ok' : 'bad';
-  if (code !== 0 && code !== 130) document.getElementById('details').open = !r.done && !r.verify;
+  showResult(text, ok);
   updateControls();
-  refreshTuning(true);   // the copy may have measured the phone
+  // Show the result in both panes, then run the next waiting copy.
+  if (job) {
+    loadPane(panes.mac, panes.mac.path, { keepSelection: true });
+    loadPane(panes.phone, panes.phone.path, { keepSelection: true });
+  }
+  refreshTuning(true);
+  startNext();
 }
 
-// -------------------------------------------------------------------- wiring ---
-ui.refresh.addEventListener('click', refreshDevices);
-ui.device.addEventListener('change', () => { showDeviceNote(); updateControls(); refreshTuning(); });
-ui.measure.addEventListener('click', measureNow);
-for (const c of [ui.verify, ui.streams, ui.compression, ui.split, ui.partSize, ui.splitMin, ui.fixNames, ui.burst, ui.libusb]) {
-  c.addEventListener('change', () => { updateControls(); saveSettingsSoon(); });
+function updateControls() {
+  ui.cancel.disabled = !state.running;
+  ui.device.disabled = ui.refresh.disabled = state.running || state.measuring;
+  ui.measure.disabled = state.running || state.measuring || !currentDevice();
+  for (const p of Object.values(panes)) updatePaneControls(p);
 }
-ui.advanced.addEventListener('toggle', saveSettingsSoon);
-let destTimer = null;
-ui.dest.addEventListener('input', () => {
-  clearTimeout(destTimer);
-  destTimer = setTimeout(() => { refreshTuning(); saveSettingsSoon(); }, 500);
-});
-for (const r of document.querySelectorAll('input[name="direction"]')) {
-  r.addEventListener('change', () => setDirection(r.value));
+
+// -------------------------------------------------------------------- tuning ---
+function destKind(path) {
+  if (/\/Android\/(data|obb)(\/|$)/.test(path)) return 'appdir';
+  if (/^\/data\//.test(path)) return 'data';
+  return 'media';
 }
-ui.addFiles.addEventListener('click', async () => addSources(await invoke('pick_local', { folders: false, multiple: true })));
-ui.addFolder.addEventListener('click', async () => addSources(await invoke('pick_local', { folders: true, multiple: true })));
-ui.addPhone.addEventListener('click', () => openBrowser('add', '/sdcard'));
-ui.remove.addEventListener('click', () => {
-  state.sources = state.sources.filter((p) => !state.selected.has(p));
-  state.selected.clear();
-  renderSources();
-});
-ui.browse.addEventListener('click', async () => {
-  if (state.direction === 'push') {
-    const start = ui.dest.value.trim().startsWith('/') ? ui.dest.value.trim() : '/sdcard';
-    openBrowser('dest', start);
+const KIND_NAMES = { media: 'shared storage', appdir: 'app folders', data: '/data' };
+const numbersAt = (pairs) => Object.values(pairs || {}).join(' · ');
+
+function showTuning(text, cls = '', title = '') {
+  ui.tuning.textContent = text;
+  ui.tuning.className = `grow small ${cls}`;
+  ui.tuning.title = title;
+}
+
+async function refreshTuning(force = false) {
+  const d = currentDevice();
+  if (state.measuring) return;
+  if (!d) { state.profileKey = ''; showTuning('Connect a phone to see its measurements.'); return; }
+  const dest = panes.phone.path || '/sdcard';
+  const key = `${d.serial}|${destKind(dest)}`;
+  if (!force && key === state.profileKey) return;
+  state.profileKey = key;
+  try {
+    const p = (await invoke('show_profile', { serial: d.serial, dest })).find((e) => e.event === 'profile');
+    if (p) describeProfile(p);
+  } catch (err) {
+    showTuning(String(err), 'bad');
+  }
+}
+
+function describeProfile(p) {
+  const where = KIND_NAMES[p.kind] || p.kind;
+  const fixed = ' Copies from the phone use fixed settings (8 parallel transfers).';
+  if (!p.saved) {
+    showTuning(`Not measured yet for this phone and ${where}. It is measured automatically before the first large copy to the phone (about 10 seconds), or now.${fixed}`);
+    return;
+  }
+  const detail = `Large files: ${numbersAt(p.large_mib_per_second)} MiB/s on 2 · 4 · 8 transfers. ` +
+    `Small files: ${numbersAt(p.small_files_per_second)} files/s on 2 · 4 · 8 transfers.`;
+  showTuning(`Measured ${p.date} for ${where}: ${plural(p.streams, 'parallel transfer')} for large files, ` +
+    `up to ${p.small_streams} for small files.${fixed}`, '', detail);
+}
+
+async function measureNow() {
+  const d = currentDevice();
+  if (!d || state.running || state.measuring) return;
+  state.measuring = true;
+  updateControls();
+  showTuning(`Measuring this phone, cable and ${panes.phone.path} (about 10 seconds)…`, 'busy');
+  try {
+    const events = await invoke('measure', { serial: d.serial, dest: panes.phone.path || '/sdcard/Download' });
+    const p = events.find((e) => e.event === 'profile');
+    state.measuring = false;
+    if (p) { describeProfile(p); state.profileKey = `${d.serial}|${p.kind}`; }
+  } catch (err) {
+    state.measuring = false;
+    showTuning(`Measuring failed: ${err}`, 'bad');
+  }
+  updateControls();
+  startNext();
+}
+
+// ------------------------------------------------------------------ settings ---
+// Remembered between launches; "Skip the free-space check" is deliberately not.
+function collectSettings() {
+  return {
+    macPath: panes.mac.path, phonePath: panes.phone.path,
+    macSort: panes.mac.sort, phoneSort: panes.phone.sort,
+    verify: ui.verify.checked, conflicts: ui.conflicts.value, showHidden: ui.showHidden.checked,
+    streams: ui.streams.value, compression: ui.compression.value, split: ui.split.value,
+    partSize: ui.partSize.value, splitMin: ui.splitMin.value,
+    fixNames: ui.fixNames.checked, burst: ui.burst.checked, libusb: ui.libusb.checked,
+  };
+}
+function applySettings(s) {
+  if (!s || typeof s !== 'object') return;
+  const set = (select, v) => { if (v != null && [...select.options].some((o) => o.value === String(v))) select.value = String(v); };
+  if (typeof s.verify === 'boolean') ui.verify.checked = s.verify;
+  if (typeof s.showHidden === 'boolean') ui.showHidden.checked = s.showHidden;
+  set(ui.conflicts, s.conflicts);
+  set(ui.streams, s.streams); set(ui.compression, s.compression); set(ui.split, s.split);
+  set(ui.partSize, s.partSize); set(ui.splitMin, s.splitMin);
+  for (const k of ['fixNames', 'burst', 'libusb']) if (typeof s[k] === 'boolean') ui[k].checked = s[k];
+  for (const side of ['mac', 'phone']) {
+    const sort = s[`${side}Sort`];
+    if (sort && ['name', 'size', 'mtime'].includes(sort.key)) panes[side].sort = { key: sort.key, dir: sort.dir < 0 ? -1 : 1 };
+    if (typeof s[`${side}Path`] === 'string' && s[`${side}Path`]) panes[side].path = s[`${side}Path`];
+  }
+}
+let saveTimer = null;
+let settingsLoaded = false;
+function saveSettingsSoon() {
+  if (!settingsLoaded) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => invoke('save_settings', { settings: collectSettings() }).catch((e) => log(`adbcp: ${e}`)), 300);
+}
+
+// ------------------------------------------------------------------ dragging ---
+// Dragging between the panes is tracked with the mouse (not HTML drag and drop, which
+// competes with the window's own handling of files dropped from Finder).
+let drag = null;
+let suppressClick = false;
+
+function paneAt(x, y) {
+  const t = document.elementFromPoint(x, y);
+  const root = t && t.closest('.pane');
+  return root ? panes[root.dataset.side] : null;
+}
+function rowAt(pane, x, y) {
+  const t = document.elementFromPoint(x, y);
+  const li = t && t.closest('li.row');
+  return li && pane.list.contains(li) ? pane.shown[li.dataset.index] : null;
+}
+function showDropHint(target, text, accept) {
+  for (const p of Object.values(panes)) {
+    const on = p === target;
+    p.hint.hidden = !on;
+    if (on) { p.hint.textContent = text; p.hint.classList.toggle('refuse', !accept); }
+  }
+}
+function clearDropMarks() {
+  for (const p of Object.values(panes)) {
+    p.hint.hidden = true;
+    for (const li of p.list.querySelectorAll('.drop-into')) li.classList.remove('drop-into');
+  }
+}
+
+// Where items dragged from side `from` would be copied to at (x, y), if anywhere.
+function dragTarget(from, x, y) {
+  const target = paneAt(x, y);
+  if (!target || target.side === from || target.message) return null;
+  const row = rowAt(target, x, y);
+  return { pane: target, dir: row && row.type === 'dir' ? row.path : target.path, row };
+}
+
+document.addEventListener('mousemove', (ev) => {
+  if (!drag) return;
+  if (!drag.active) {
+    if (Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y) < 6) return;
+    drag.active = true;
+    ui.ghost.textContent = plural(drag.items.length, 'item');
+    ui.ghost.hidden = false;
+  }
+  ui.ghost.style.left = `${ev.clientX + 14}px`;
+  ui.ghost.style.top = `${ev.clientY + 10}px`;
+  clearDropMarks();
+  const t = dragTarget(drag.from, ev.clientX, ev.clientY);
+  if (!t) return;
+  if (t.row && t.row.type === 'dir') {
+    const li = t.pane.list.querySelector(`li[data-index="${t.pane.shown.indexOf(t.row)}"]`);
+    if (li) li.classList.add('drop-into');
   } else {
-    const [dir] = await invoke('pick_local', { folders: true, multiple: false });
-    if (dir) { ui.dest.value = dir.replace(/\/?$/, '/'); updateControls(); saveSettingsSoon(); }
+    showDropHint(t.pane, `Drop to copy into ${basename(t.dir) || t.dir}`, true);
   }
 });
-ui.dest.addEventListener('input', updateControls);
-ui.start.addEventListener('click', startCopy);
+
+document.addEventListener('mouseup', (ev) => {
+  if (!drag) return;
+  const d = drag;
+  drag = null;
+  ui.ghost.hidden = true;
+  clearDropMarks();
+  if (!d.active) return;
+  suppressClick = true;
+  setTimeout(() => { suppressClick = false; }, 0);
+  const t = dragTarget(d.from, ev.clientX, ev.clientY);
+  if (t) copyItems(d.from, d.items, t.dir);
+});
+
+// Files dragged in from Finder: only the phone pane accepts them.
+listen('drag-hover', ({ payload }) => {
+  if (!payload.over) { clearDropMarks(); return; }
+  const target = paneAt(payload.at.x, payload.at.y);
+  if (!target) { clearDropMarks(); return; }
+  if (target.side === 'phone') {
+    const ok = !!currentDevice();
+    showDropHint(target, ok ? `Drop to copy to the phone, into ${basename(target.path) || target.path}` : 'Connect a phone first', ok);
+  } else {
+    showDropHint(target, 'Drop on the phone side to copy to the phone', false);
+  }
+});
+listen('files-dropped', ({ payload }) => {
+  clearDropMarks();
+  const target = paneAt(payload.at.x, payload.at.y);
+  if (target && target.side === 'phone' && currentDevice()) copyItems('mac', payload.paths, target.path);
+});
+
+// -------------------------------------------------------------------- wiring ---
+for (const pane of Object.values(panes)) {
+  pane.root.addEventListener('mousedown', () => setActive(pane.side));
+  pane.list.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 0) return;
+    const li = ev.target.closest('li.row');
+    if (!li) return;
+    const e = pane.shown[li.dataset.index];
+    // Pressing on an unselected item selects it, so it can be dragged right away.
+    if (!pane.selected.has(e.path) && !ev.metaKey && !ev.shiftKey) {
+      pane.selected = new Set([e.path]);
+      pane.anchor = Number(li.dataset.index);
+      renderSelection(pane);
+    }
+    if (!ev.metaKey && !ev.shiftKey && currentDevice()) {
+      drag = { from: pane.side, x: ev.clientX, y: ev.clientY, active: false, items: selectedEntries(pane).map((x) => x.path) };
+    }
+  });
+  pane.list.addEventListener('click', (ev) => {
+    if (suppressClick) return;
+    const li = ev.target.closest('li.row');
+    if (li) clickRow(pane, Number(li.dataset.index), ev);
+    else { pane.selected.clear(); renderSelection(pane); }
+  });
+  pane.list.addEventListener('dblclick', (ev) => {
+    const li = ev.target.closest('li.row');
+    if (li) openEntry(pane, pane.shown[li.dataset.index]);
+  });
+  pane.up.addEventListener('click', () => loadPane(pane, parentOf(pane.path)));
+  pane.reload.addEventListener('click', () => loadPane(pane, pane.path, { keepSelection: true }));
+  pane.path$.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { loadPane(pane, pane.path$.value); pane.list.focus(); } });
+  pane.places.addEventListener('change', () => {
+    if (pane.places.value) loadPane(pane, pane.places.value);
+    pane.places.value = '';
+  });
+  pane.mkdir.addEventListener('click', () => newFolder(pane));
+  pane.rename.addEventListener('click', () => renameItem(pane));
+  pane.del.addEventListener('click', () => deleteItems(pane));
+  pane.copy.addEventListener('click', () => copySelection(pane.side));
+  for (const h of pane.heads) {
+    h.addEventListener('click', () => {
+      pane.sort = pane.sort.key === h.dataset.sort ? { key: h.dataset.sort, dir: -pane.sort.dir } : { key: h.dataset.sort, dir: 1 };
+      renderPane(pane);
+      saveSettingsSoon();
+    });
+  }
+}
+
+document.addEventListener('keydown', (ev) => {
+  if (!ui.dialog.hidden) {
+    if (dialogKey && (ev.key === 'Escape' || ev.key === 'Enter')) { ev.preventDefault(); dialogKey(ev.key); }
+    return;
+  }
+  if (!ui.settings.hidden) { if (ev.key === 'Escape') ui.settings.hidden = true; return; }
+  if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT') return;
+  const pane = panes[state.activeSide];
+  if (ev.metaKey && ev.key === 'a') { ev.preventDefault(); pane.selected = new Set(pane.shown.map((e) => e.path)); renderSelection(pane); }
+  else if (ev.metaKey && ev.key === 'ArrowUp') { ev.preventDefault(); loadPane(pane, parentOf(pane.path)); }
+  else if (ev.metaKey && ev.key === 'Backspace') { ev.preventDefault(); deleteItems(pane); }
+  else if (ev.metaKey && ev.shiftKey && (ev.key === 'n' || ev.key === 'N')) { ev.preventDefault(); newFolder(pane); }
+  else if (ev.key === 'Enter') {
+    const sel = selectedEntries(pane);
+    if (sel.length === 1) { ev.preventDefault(); openEntry(pane, sel[0]); }
+  }
+});
+
+ui.refresh.addEventListener('click', async () => { await refreshDevices(); refreshTuning(true); });
+ui.device.addEventListener('change', () => { updateControls(); loadPane(panes.phone, panes.phone.path); refreshTuning(true); });
+ui.openSettings.addEventListener('click', () => { ui.settings.hidden = false; refreshTuning(true); });
+ui.closeSettings.addEventListener('click', () => { ui.settings.hidden = true; });
+ui.settings.addEventListener('mousedown', (ev) => { if (ev.target === ui.settings) ui.settings.hidden = true; });
+ui.measure.addEventListener('click', measureNow);
+ui.showHidden.addEventListener('change', () => { renderPane(panes.mac); renderPane(panes.phone); });
+for (const c of [ui.verify, ui.conflicts, ui.showHidden, ui.streams, ui.compression, ui.split, ui.partSize, ui.splitMin, ui.fixNames, ui.burst, ui.libusb]) {
+  c.addEventListener('change', () => {
+    ui.partSize.disabled = ui.splitMin.disabled = ui.split.value !== '1';
+    saveSettingsSoon();
+  });
+}
 ui.cancel.addEventListener('click', async () => {
+  // Cancel stops the running copy and drops the waiting ones.
+  state.queue = [];
+  renderQueueInfo();
   ui.stats.textContent = 'Cancelling…';
   await invoke('cancel_copy');
 });
-ui.retry.addEventListener('click', () => { ui.skip.checked = true; startCopy(); });
-ui.safeNames.addEventListener('click', () => startCopy({ skipExisting: true, fixNames: true }));
-
-ui.up.addEventListener('click', () => browse(parentOf(browser.path)));
-ui.hiddenFiles.addEventListener('change', renderBrowser);
-ui.browserCancel.addEventListener('click', closeBrowser);
-ui.choose.addEventListener('click', () => {
-  if (browser.mode === 'dest') {
-    ui.dest.value = browser.path.replace(/\/?$/, '/');
-    refreshTuning();
-    saveSettingsSoon();
-  } else {
-    addSources([...browser.checked]);
-  }
-  closeBrowser();
-  updateControls();
+ui.retry.addEventListener('click', () => { if (state.lastJob) enqueue({ ...state.lastJob, skipExisting: true }); });
+ui.safeNames.addEventListener('click', () => {
+  if (state.lastJob) enqueue({ ...state.lastJob, skipExisting: true, fixNames: true, label: `${state.lastJob.label} (with safe names)` });
 });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !ui.browser.hidden) closeBrowser(); });
 
 listen('engine-event', ({ payload }) => onEvent(payload));
 listen('engine-log', ({ payload }) => log(payload));
 listen('engine-exit', ({ payload }) => onExit(payload));
-listen('files-dropped', ({ payload }) => {
-  if (state.direction === 'push' && !state.running && !state.measuring) addSources(payload);
-});
-listen('drag-hover', ({ payload: over }) => {
-  const accept = state.direction === 'push' && !state.running && !state.measuring;
-  ui.dropHint.textContent = accept ? 'Drop to add to the list'
-    : state.direction !== 'push' ? 'Files can be dropped when copying from the computer to the phone'
-    : 'Wait for the current copy to finish';
-  ui.dropHint.classList.toggle('refuse', !accept);
-  ui.dropHint.hidden = !over;
-});
 
 // --------------------------------------------------------------------- start ---
 (async () => {
-  ui.dest.value = state.phoneDest;
-  try { await applySettings(await invoke('load_settings')); } catch (err) { log(`adbcp: ${err}`); }
-  renderSources();
-  await refreshDevices();
-  // Automated smoke tests: ADBCP_APP_AUTORUN describes a copy to start right away.
+  try { applySettings(await invoke('load_settings')); } catch (err) { log(`adbcp: ${err}`); }
+  settingsLoaded = true;
+  ui.partSize.disabled = ui.splitMin.disabled = ui.split.value !== '1';
+  try { state.localPlaces = await invoke('local_places'); } catch (_) { state.localPlaces = []; }
+  fillPlaces(panes.mac, state.localPlaces);
+  fillPlaces(panes.phone, PHONE_PLACES);
+  const downloads = state.localPlaces.find(([n]) => n === 'Downloads');
+  if (!panes.mac.path) panes.mac.path = downloads ? downloads[1] : '/';
+  if (!panes.phone.path) panes.phone.path = '/sdcard/Download';
+  setActive('mac');
+  await loadPane(panes.mac, panes.mac.path);
+  // Automated smoke tests: ADBCP_APP_AUTORUN describes a copy to start right away
+  // ("downloadAdb": true downloads adb without asking, if it is missing).
   const job = await invoke('autorun');
-  if (job) {
-    if (job.pull) {
-      document.querySelector('input[value="pull"]').checked = true;
-      await setDirection('pull');
-    }
-    addSources(job.sources || []);
-    if (job.dest) ui.dest.value = job.dest;
-    ui.verify.checked = job.verify !== false;
-    ui.skip.checked = !!job.skipExisting;
-    ui.fixNames.checked = !!job.fixNames;
-    updateControls();
-    if (!ui.start.disabled) startCopy();
+  state.autoDownloadAdb = !!(job && job.downloadAdb);
+  setPhoneMessage('Looking for the phone…');
+  await refreshDevices();          // checks adb first, then loads the phone pane
+  await refreshTuning(true);
+  if (job && Array.isArray(job.sources) && job.dest && currentDevice()) {
+    if (job.verify !== undefined) ui.verify.checked = job.verify !== false;
+    if (job.pull) await loadPane(panes.mac, job.dest); else await loadPane(panes.phone, job.dest);
+    enqueue({
+      pull: !!job.pull, sources: job.sources, dest: withSlash(normalize(job.dest)), destSide: job.pull ? 'mac' : 'phone',
+      skipExisting: !!job.skipExisting, fixNames: !!job.fixNames, label: `Copying (test run) to ${job.dest}`,
+    });
   }
 })();
