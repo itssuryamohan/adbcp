@@ -191,6 +191,19 @@ is the first engine version, which sent one file for each request.
 On a USB 2.0 cable, the same phone reached about 34 MB/s without compression. With data
 that compresses well, the effective speed reached about 108 MB/s.
 
+Galaxy S21 Ultra (SM-G998B, Exynos 2100, Android 15, One UI 7) over USB 3 (5 Gb/s), the
+same 12.6 GB folder (1,881 files), on 2026-11-19:
+
+| Task | Plain `adb` | adbcp |
+|---|---|---|
+| Copy to the phone | 160 s (80 MiB/s) | 65 s (199.7 MiB/s); 61 s (212.9 MiB/s) on a second run |
+| Verify | — | 23 s |
+| Copy from the phone | 104 s (124 MiB/s) | 48 s (266.7 MiB/s) |
+
+The measurement chose 8 parallel transfers (88, 147, and 173 MiB/s on 2, 4, and 8) and
+4 checksum workers. The S21 Ultra is slower than the S23 Ultra, which fits its older
+chip and storage. adbcp was still about 2.2 to 2.6 times faster than plain adb.
+
 Over Wi-Fi (Wireless debugging), 300 MiB of video to the same phone:
 
 | Plan | Speed |
@@ -304,7 +317,7 @@ partial file and no process remained.
 
 ## 10. Open questions
 
-1. All measurements come from one phone (Galaxy S23 Ultra). Other phones, USB 2.0 cables, and Wi-Fi connections need tests.
+1. Measurements come from two phones (Galaxy S23 Ultra, Galaxy S21 Ultra), both Samsung. Phones from other makers and USB 2.0 cables on other phones need tests.
 
 [app-spec.md](app-spec.md#7-decisions-and-open-questions) lists the questions about the app.
 
