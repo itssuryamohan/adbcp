@@ -2,6 +2,7 @@
 name = "adbcp-app"
 version = "0.3.0"
 description = "Desktop app for the adbcp copy engine"
+license = "MIT"
 edition = "2021"
 
 [build-dependencies]

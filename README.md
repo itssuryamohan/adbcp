@@ -104,12 +104,18 @@ These are not bugs, but they can surprise you:
 | [Engine specification](docs/engine-spec.md) | How the engine works, and its JSON events |
 | [App specification](docs/app-spec.md) | The app design and tests |
 
+## License
+
+adbcp is under the [MIT License](LICENSE). You can use, copy, change, and share the
+code for any purpose. Keep the copyright notice and the license text in your copies.
+The license gives no warranty and no liability. See also the [Disclaimer](#disclaimer).
+
 ## Third-party software
 
 - **adb** (Android platform-tools) comes from Google, under Google's license. This
   repository and the app do not include it. adbcp downloads it from Google when needed.
   The app asks first.
-- **Tauri** and the other Rust and npm packages have their own licenses. The lists are
+- **Tauri** and the other Rust and npm packages have their own licenses (mostly MIT or Apache-2.0). The lists are
   in `app/src-tauri/Cargo.lock` and `app/package-lock.json`.
 
 ## Disclaimer
