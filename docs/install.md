@@ -3,7 +3,8 @@
 ## What you need
 
 - **A Mac** with Apple Silicon or Intel and a current macOS. The app needs macOS 11 or later.
-- **An Android phone** with USB debugging turned on. See [Turn on USB debugging](#turn-on-usb-debugging).
+- **An Android phone.** With USB debugging on, copies are fastest. See [Turn on USB debugging](#turn-on-usb-debugging).
+  Without it, the app copies in the phone's normal "File transfer" mode. See [Use the app without USB debugging](#use-the-app-without-usb-debugging).
 - **A USB data cable.** Use a USB 3 cable in a USB 3 port. USB 3 is 5 to 10 times faster than USB 2.0.
 - **Google's adb.** adbcp finds an installed copy, or downloads it for you. See [Get adb](#get-adb).
 
@@ -23,6 +24,20 @@ The menu names can differ on some phones. Samsung phones show **Build number** u
 
 > USB debugging lets an allowed computer control the phone. Turn it off when you do not
 > need it.
+
+## Use the app without USB debugging
+
+The desktop app also works with USB debugging off. It then copies over MTP, the
+standard "File transfer" mode of Android phones. It needs no adb.
+
+1. Connect the phone with the cable and unlock it.
+2. Pull down the notification panel and tap the USB notification.
+3. Choose **Transferring files** (or **File transfer**).
+
+The **Phone** list shows the phone as "SM-S918B · USB (no debugging)".
+
+MTP sends one file at a time, without compression. On the test phone, copies took 2 to 3
+times longer than with USB debugging. Many small files are slowest.
 
 ## Get the command-line tool
 

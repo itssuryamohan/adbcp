@@ -4,7 +4,7 @@ Engine specification
 
 | | |
 |---|---|
-| Status | The copy engine (command-line tool `adbcp`) works in both directions. The desktop app is at version 0.3.0. See [app-spec.md](app-spec.md). |
+| Status | The copy engine (command-line tool `adbcp`) works in both directions. The desktop app is at version 0.4.0. See [app-spec.md](app-spec.md). |
 | Platform | macOS on Apple Silicon and Intel. The engine mostly works on Linux. Windows is not supported. |
 | Last updated | 2026-11-19 |
 
@@ -195,6 +195,19 @@ folder took 70 s (185 MiB/s). adbcp took 36–37 s (349–354 MiB/s) to the phon
 On a USB 2.0 cable, the same phone reached about 34 MB/s without compression. With data
 that compresses well, the effective speed reached about 108 MB/s.
 
+**MTP (no USB debugging).** The desktop app copies over MTP when USB debugging is off,
+through the `adbcp-mtp` library (`mtp/`), not this engine. Same S23 Ultra, same 12.6 GB
+folder, on 2026-11-20:
+
+| Task | MTP | Plain `adb` | adbcp |
+|---|---|---|---|
+| Copy to the phone | 97.5 s (132 MiB/s; files of 1 MiB or more 196 MiB/s) | 70 s | 32–37 s |
+| Copy from the phone | 86.5 s (149 MiB/s) | 68–76 s | 32–34 s |
+| One 1.37 GiB file, to / from the phone | 6.1 s / 7.2 s (232 / 195 MiB/s) | — | — |
+
+MTP allows one operation at a time and has no compression, and each file costs several
+round trips. Large files are fast, but many small files are slow.
+
 Galaxy S21 Ultra (SM-G998B, Exynos 2100, Android 15, One UI 7) over USB 3 (5 Gb/s), the
 same 12.6 GB folder (1,881 files), on 2026-11-19:
 
@@ -251,9 +264,9 @@ during the copy.
 | `done` | The copy is complete | `files_copied`, `files_failed`, `bytes`, `seconds`, `bytes_per_second` |
 | `verify_start` | Verification starts | `files` |
 | `verify_problem` | A file failed verification | `problem` (`missing`: the copy is missing or cannot be read; `unreadable`: the original cannot be read; `different`), `path` |
-| `verify_done` | Verification is complete | `files`, `problems`, `seconds` |
+| `verify_done` | Verification is complete | `files`, `problems`, `seconds`, and `method` (`size`) from the MTP library, which compares sizes only |
 | `error` | The copy cannot continue. The engine also sends it on cancel, with the message `interrupted`. | `message` |
-| `device` | One for each phone, from `adbcp --devices --json` | `serial`, `state` (`device` when ready, or `unauthorized`, `offline`, …), `model`, `connection`, `link_mbps` |
+| `device` | One for each phone, from `adbcp --devices --json` (and from the MTP library, with `connection` `mtp`) | `serial`, `state` (`device` when ready, or `unauthorized`, `offline`, …; `busy` with a `message` for an MTP phone that another program holds), `model`, `connection` (`usb`, `network`, or `mtp`), `link_mbps` |
 | `entry` | One for each file or folder, from `adbcp --ls PATH --json` | `name`, `path`, `type` (`dir`, `file`, or `other`), `size`, `mtime` |
 | `op_done` | `--mkdir`, `--rename`, `--delete`, or a `--wifi-` command was successful | `op` (`mkdir`, `rename`, `delete`, `wifi_pair`, `wifi_connect`, `wifi_disconnect`), `count` |
 | `wifi_service` | One for each service, from `adbcp --wifi-scan --json` | `name`, `kind` (`pairing` or `connect`), `address` (`IP:port`) |

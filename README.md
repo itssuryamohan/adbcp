@@ -32,6 +32,11 @@ each piece. adbcp uses the same adb, but it:
 | Galaxy S21 Ultra (Exynos 2100, Android 15) | Mac to phone | 61–65 s (200–213 MiB/s) | 160 s (80 MiB/s) | about 2.5× |
 | | Phone to Mac | 48 s (267 MiB/s) | 104 s (124 MiB/s) | about 2.2× |
 
+Without USB debugging, the app copies over MTP (the phone's normal "File transfer"
+mode). For the same folder on the S23 Ultra, that took 97.5 s to the phone and 86.5 s
+back: slower than adb, because MTP sends one file at a time, but it needs no Developer
+options.
+
 Ranges come from runs on different days. The adbcp times do not include the first-time
 measurement of each phone (about 10 seconds). Over a USB 2.0 cable, the S23 Ultra
 reached about 34 MB/s. Your phone, cable, and Mac can give different results.
@@ -74,6 +79,7 @@ The app shows two file lists side by side: this Mac on the left, the phone on th
 - Make folders, rename, and delete on both sides.
 - See the progress, speed, time left, and problems in the transfer bar.
 - Connect the phone over Wi-Fi with a QR code (Wireless debugging), without a cable.
+- Copy without USB debugging, in the phone's normal "File transfer" mode (MTP). This is slower, and needs no adb.
 
 Download the app from the **Releases** page. It runs on Apple Silicon and Intel Macs.
 Apple did not notarize it, so you must allow it one time. See

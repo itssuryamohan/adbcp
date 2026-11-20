@@ -16,6 +16,24 @@ The app uses the same engine as the command-line tool. For the full design, see 
 If the phone does not show, click **Refresh**. If the phone pane shows a message, follow
 its steps.
 
+## Copy without USB debugging
+
+If USB debugging is off, the app copies over MTP, the phone's "File transfer" mode.
+The **Phone** list shows "SM-S918B · USB (no debugging)", and a note at the top says so.
+See [Install](install.md#use-the-app-without-usb-debugging).
+
+In this mode:
+
+- Copies, new folders, rename, and delete work as usual.
+- **Calibrate & copy** and **Measure now** are off. MTP sends one file at a time, so there is nothing to tune.
+- **Verify after copying** compares file sizes only. MTP cannot read checksums on the phone.
+- Only the internal storage (`/sdcard`) is reachable, and Android hides `Android/data` and `Android/obb`.
+- The app works without adb.
+
+If the list shows "in use by another app", macOS's photo service or Android File
+Transfer holds the phone. Quit Android File Transfer, or run `pkill -9 ptpcamerad` in
+Terminal, then click **Refresh**.
+
 ## Connect over Wi-Fi
 
 You can use the phone without a cable. The phone and the Mac must be on the same Wi-Fi

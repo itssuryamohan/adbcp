@@ -9,6 +9,7 @@
 # Desktop app: dependencies and build output (rebuilt with `npm install` / `npm run build`)
 /app/node_modules/
 /app/src-tauri/target/
+/mtp/target/
 /app/src-tauri/gen/
 
 # Editors

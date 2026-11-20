@@ -217,6 +217,8 @@ async function ensureAdb() {
 function deviceLabel(d) {
   const name = d.model || d.serial;
   if (d.state === 'unauthorized') return `${name} · allow this computer on the phone`;
+  if (d.state === 'busy') return `${name} · in use by another app`;
+  if (d.connection === 'mtp') return `${name} · USB (no debugging)`;
   if (d.state !== 'device') return `${name} · ${d.state}`;
   if (d.connection !== 'usb') return `${name} · Wi-Fi`;
   if (!d.link_mbps) return `${name} · USB`;
@@ -226,9 +228,25 @@ function currentDevice() {
   return state.devices.find((d) => d.serial === ui.device.value && d.state === 'device');
 }
 
+async function listAllDevices() {
+  try { return await invoke('list_devices'); } catch (err) { log(`adbcp: ${err}`); return []; }
+}
+
 async function refreshDevices() {
   const before = currentDevice()?.serial;
-  if (!(state.adb && state.adb.found) && !(await ensureAdb())) {
+  // Phones in File transfer mode (MTP) work without adb, so list them first and ask for
+  // adb only when no such phone is there.
+  let devices = await listAllDevices();
+  if (!(state.adb && state.adb.found)) {
+    if (devices.some((d) => d.connection === 'mtp')) {
+      state.adb = await adbStatus();
+      state.adbMissing = !state.adb.found;
+      showAdbInfo();
+    } else if (await ensureAdb()) {
+      devices = await listAllDevices();
+    }
+  }
+  if (!devices.length && state.adbMissing) {
     state.devices = [];
     ui.device.innerHTML = '';
     ui.device.append(el('option', '', 'adb is not installed'));
@@ -237,8 +255,6 @@ async function refreshDevices() {
     return;
   }
   ui.device.innerHTML = '';
-  let devices = [];
-  try { devices = await invoke('list_devices'); } catch (err) { log(`adbcp: ${err}`); }
   state.devices = devices;
   for (const d of devices) {
     const o = el('option', '', deviceLabel(d));
@@ -251,7 +267,9 @@ async function refreshDevices() {
   if (!devices.length) ui.device.append(el('option', '', 'No phone found'));
   const d = currentDevice();
   ui.deviceNote.textContent = d && d.connection === 'usb' && d.link_mbps && d.link_mbps < 5000
-    ? `USB 2.0 speed (${d.link_mbps} Mb/s): a USB 3 cable and port can be 5–10× faster.` : '';
+    ? `USB 2.0 speed (${d.link_mbps} Mb/s): a USB 3 cable and port can be 5–10× faster.`
+    : d && d.connection === 'mtp'
+      ? 'No USB debugging: copies use MTP, one file at a time. USB debugging makes them 2–3× faster.' : '';
   updateControls();
   await loadPane(panes.phone, panes.phone.path);
 }
@@ -458,7 +476,10 @@ async function loadPane(pane, path, { keepSelection = false } = {}) {
   if (pane.side === 'phone' && !currentDevice()) {
     pane.path = path;
     pane.entries = [];
-    pane.message = state.adbMissing
+    const busy = state.devices.find((x) => x.state === 'busy');
+    pane.message = busy
+      ? `The phone is connected in File transfer mode, but another program is using it:\n${busy.message}`
+      : state.adbMissing
       ? (state.adbError ? `Downloading adb failed: ${state.adbError}\n\n` : '') +
         'adbcp needs Google’s adb to reach the phone.\nPress Refresh to download it from Google, or install it yourself (for example with Homebrew: brew install android-platform-tools) and press Refresh.'
       : state.devices.length
@@ -554,9 +575,9 @@ function updatePaneControls(pane) {
   pane.reload.disabled = pane.path$.disabled = pane.places.disabled = !ready;
   pane.copy.disabled = !sel.length || !currentDevice() || state.measuring;
   if (pane.calibrate) {
-    pane.calibrate.disabled = pane.copy.disabled;
+    pane.calibrate.disabled = pane.copy.disabled || currentDevice()?.connection === 'mtp';
     const p = state.profile;
-    pane.copy.title = !p ? '' : p.saved
+    pane.copy.title = !p ? '' : p.kind === 'mtp' ? 'Copy over MTP, one file at a time' : p.saved
       ? `Copy with the settings measured on ${p.date} for ${KIND_NAMES[p.kind] || p.kind}`
       : 'Not measured yet: copies with built-in settings. Calibrate & copy measures first.';
   }
@@ -876,7 +897,9 @@ function onEvent(e) {
       ui.bar.classList.remove('busy');
       ui.stats.textContent = ui.stats.textContent.replace(/ Verifying .*$/, '') + (e.problems
         ? ` Verification found ${plural(e.problems, 'problem')}.`
-        : ` Verified: all ${plural(e.files, 'file')} match.`);
+        : e.method === 'size'
+          ? ` Checked: ${e.files === 1 ? 'the file has' : `all ${plural(e.files, 'file')} have`} the right size (MTP cannot compare contents).`
+          : ` Verified: all ${plural(e.files, 'file')} match.`);
       break;
     case 'warning':
       log(`Warning: ${e.message}`);
@@ -899,7 +922,9 @@ function onExit(code) {
   } else if (code === 0) {
     ok = true;
     text = r.done ? `Done: ${plural(r.done.files_copied, 'file')} copied.` : 'Done.';
-    if (r.verify) text += ` All ${plural(r.verify.files, 'file')} verified.`;
+    if (r.verify) text += r.verify.method === 'size'
+      ? ` ${r.verify.files === 1 ? 'The file has' : `All ${plural(r.verify.files, 'file')} have`} the right size.`
+      : ` All ${plural(r.verify.files, 'file')} verified.`;
     if (r.renamed) text += ` ${plural(r.renamed, 'file')} got safe names (see Details).`;
   } else if (r.done || r.verify) {
     // Names the phone does not allow are reported, never retried as they are:
@@ -928,7 +953,7 @@ function onExit(code) {
 function updateControls() {
   ui.cancel.disabled = !state.running;
   ui.device.disabled = ui.refresh.disabled = state.running || state.measuring;
-  ui.measure.disabled = state.running || state.measuring || !currentDevice();
+  ui.measure.disabled = state.running || state.measuring || !currentDevice() || currentDevice().connection === 'mtp';
   for (const p of Object.values(panes)) updatePaneControls(p);
 }
 
@@ -966,6 +991,11 @@ async function refreshTuning(force = false) {
 function describeProfile(p) {
   state.profile = p;
   for (const pane of Object.values(panes)) updatePaneControls(pane);
+  if (p.kind === 'mtp') {
+    showTuning('This phone is connected without USB debugging, so copies use MTP: one file at a time, ' +
+      'nothing to measure. Turn on USB debugging for copies about 2–3 times faster.');
+    return;
+  }
   const where = KIND_NAMES[p.kind] || p.kind;
   const fixed = ' Copies from the phone use fixed settings (8 parallel transfers).';
   if (!p.saved) {

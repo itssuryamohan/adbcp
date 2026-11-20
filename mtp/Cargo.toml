@@ -1,0 +1,24 @@
+[package]
+name = "adbcp-mtp"
+version = "0.1.0"
+edition = "2021"
+description = "MTP back end for adbcp: copy files to and from Android phones without USB debugging"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "adbcp-mtp"
+path = "src/main.rs"
+
+[dependencies]
+mtp-rs = "0.38"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+strip = true

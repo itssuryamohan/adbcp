@@ -6,6 +6,9 @@
 adbcp                    the copy engine (one bash script)
 README.md                overview, safety notes, disclaimer
 docs/                    guides and specifications
+mtp/                     adbcp-mtp: copies over MTP (Rust library and CLI)
+  src/lib.rs             devices, listing, file operations, copies
+  src/main.rs            the adbcp-mtp command-line tool
 app/                     desktop app (Tauri 2)
   package.json           build scripts and the Tauri command-line tool
   src/                   the window: index.html, styles.css, main.js
@@ -20,8 +23,23 @@ app/                     desktop app (Tauri 2)
 
 The engine and the app are separate:
 
-- The engine does all copying, measuring, and checking.
+- The engine does all copying, measuring, and checking over adb.
 - The app starts the engine with `--json` and shows the events it prints.
+- For a phone without USB debugging, the app calls the `adbcp-mtp` library (in `mtp/`)
+  in-process. The library sends the same events.
+
+To test the MTP library on a phone in File transfer mode:
+
+```bash
+cd mtp
+cargo test                                          # unit tests, no phone needed
+cargo run --release -- devices
+cargo run --release -- ls SERIAL /sdcard/Download
+cargo run --release -- push SERIAL --verify ~/Movies/trip.mp4 /sdcard/Download/
+```
+
+`adbcp-mtp --help` lists the commands. Only one program can use a phone's MTP
+connection at a time: quit the app before you run the CLI.
 
 See the [Engine specification](engine-spec.md) and the [App specification](app-spec.md).
 
@@ -125,10 +143,11 @@ Each run does these steps:
 
 1. Checks that a tag points to a commit on `main`. If not, the run stops.
 2. Checks the engine with the macOS bash 3.2.
-3. Builds the app for Apple Silicon and Intel.
-4. Verifies the signature and zips the app.
-5. Keeps the zip as a workflow artifact for about 14 days.
-6. For a tag, attaches the zip to a GitHub release.
+3. Runs the unit tests of the MTP library.
+4. Builds the app for Apple Silicon and Intel.
+5. Verifies the signature and zips the app.
+6. Keeps the zip as a workflow artifact for about 14 days.
+7. For a tag, attaches the zip to a GitHub release.
 
 ## Make a release
 
@@ -154,6 +173,7 @@ The zip name comes from the version in `tauri.conf.json`. Use the same version i
 
 - Run `/bin/bash -n adbcp`.
 - Run `node --check app/src/main.js`.
+- Run `cargo test` in `mtp/`.
 - Build the app once.
 - Copy a test folder to a real phone and back, with `--verify`.
 - Update the docs in `docs/` when you change options, events, or behavior.

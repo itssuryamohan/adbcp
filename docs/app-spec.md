@@ -4,7 +4,7 @@ App specification: the window for the adbcp copy engine
 
 | | |
 |---|---|
-| Status | Version 0.3.0 with a two-pane window. Copies in both directions work end to end. |
+| Status | Version 0.4.0: two-pane window, Wi-Fi setup, and copies without USB debugging (MTP). Copies in both directions work end to end. |
 | Platform | macOS 11 or later, Apple Silicon and Intel |
 | Built with | *Tauri* 2: a small Rust program that shows a window made with HTML, CSS, and JavaScript |
 | Size | About 3 MB for one architecture, about 6.6 MB for Apple Silicon and Intel. The app does not include Google's adb (see 3.1). |
@@ -79,6 +79,19 @@ Settings shows which adb the app uses and where it came from.
 - Without a ready phone, the phone pane tells the user what to do: the cable, *USB debugging*, and allowing the computer.
 - A note shows when the phone uses a USB 2.0 connection.
 - A phone on Wi-Fi shows as "SM-S918B · Wi-Fi".
+- A phone without USB debugging, in File transfer mode, shows as "SM-S918B · USB (no debugging)". See **MTP** below.
+- A phone in File transfer mode that another program holds shows as "· in use by another app". The phone pane then names the usual cause: macOS's `ptpcamerad`, or Android File Transfer.
+
+**MTP (no USB debugging).** The app lists the phones that adb reaches, then the phones in
+MTP mode that adb does not reach. A phone that adb lists but cannot use yet
+(unauthorized, offline) and that MTP reaches is listed once, as the MTP phone. For an MTP
+phone:
+
+- Listing, copies, new folder, rename, and delete go through the `adbcp-mtp` library (`mtp/`), in-process. It sends the same events as the engine.
+- **Calibrate & copy** and **Measure now** are off, and Tuning explains why. The note next to the Phone list says that USB debugging makes copies 2 to 3 times faster.
+- Verify compares sizes only (`verify_done` has `"method": "size"`), and the transfer bar says so.
+- The app works without adb: it lists MTP phones first and asks to download adb only when there is none.
+- Only internal storage (`/sdcard/...`) is reachable. The library maps `/sdcard` and `/storage/emulated/0` to the phone's first storage.
 
 **Wi-Fi (Wireless debugging).** **Wi-Fi…** next to **Refresh** opens a sheet:
 
@@ -300,7 +313,22 @@ The Rust core sends these events to the window:
 The positions in `drag-hover` and `files-dropped` let the window find the pane under the
 pointer.
 
-### 4.3 Engine
+### 4.3 MTP library
+
+The Rust core links the `adbcp-mtp` library (`mtp/`), built on the `mtp-rs` crate (pure
+Rust, no libusb). It keeps the set of MTP phones from the last `list_devices`, and sends
+`list_dir`, `phone_op`, and `start_copy` for those phones to the library. `show_profile`
+returns `{"event":"profile","saved":false,"kind":"mtp"}`, and `measure` refuses. A copy
+runs as an async task. **Cancel** sets its stop flag, the same way Ctrl-C does in the CLI.
+
+The library keeps one MTP session per phone, because a phone allows one at a time. It:
+
+- Uploads a file that replaces another under a temporary name (`NAME.adbcp-part`), deletes the old file, then renames the new one.
+- Downloads to `NAME.adbcp-part` and renames when complete.
+- Leaves nothing on the phone when an upload is cancelled.
+- Refuses to delete storage roots and standard folders, with the same rules as the engine.
+
+### 4.4 Engine
 
 The build copies the engine into the app, in `Contents/Resources/engine/`. It does not
 copy adb.
@@ -308,7 +336,7 @@ copy adb.
 The app sets `ADBCP_NO_DOWNLOAD=1` for every engine run. Thus the engine never downloads
 adb by itself. Only `get_adb` downloads adb, after the user agrees.
 
-### 4.4 Safety
+### 4.5 Safety
 
 - The window cannot give arbitrary options to the engine. The Rust core makes the command from typed fields.
 - The engine runs in its own *process group*. Cancel or quit stops every transfer that the engine started.
@@ -440,6 +468,7 @@ Decided:
 6. Copies onto existing names ask Replace / Skip existing / Cancel by default.
 7. From version 0.3.0, the app does not include Google's adb. It uses an installed adb, or asks before it downloads Google's package. Thus the app can be shared without passing on Google's software.
 8. The user chooses when to measure: **Copy** or **Calibrate & copy**. The app never lets the engine measure by itself. The user decides when to spend the 10 seconds or more that measuring takes.
+9. Phones without USB debugging are reached over MTP, as a slower fallback (version 0.4.0). MTP code is a Rust library linked into the app, not a second program, so universal builds and the CI stay simple. Rust was chosen over Go for `mtp-rs`: pure Rust (no libusb), MIT or Apache-2.0, and the same language as the app core.
 
 Open:
 

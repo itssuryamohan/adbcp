@@ -5,20 +5,39 @@
 // with --json, forwards its events to the window ("engine-event", "engine-log",
 // "engine-exit"), and cancels it with SIGINT. The engine runs in its own process group
 // so that its interrupt handler can stop every transfer it started.
+//
+// Phones that are connected by USB without USB debugging (in "File transfer" mode) are
+// reached over MTP instead, through the adbcp-mtp library (../../mtp). It reports the same
+// events, so the window treats both alike.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// Process id of the running copy, which is also its process group id.
+/// The running copy: the engine's process id (also its process group id), or the stop
+/// flag of an MTP copy.
+enum Job {
+    Engine(i32),
+    Mtp(Arc<AtomicBool>),
+}
 #[derive(Default)]
-struct Running(Mutex<Option<i32>>);
+struct Running(Mutex<Option<Job>>);
+
+/// Serial numbers of the phones that are reached over MTP (not seen by adb).
+#[derive(Default)]
+struct MtpPhones(Mutex<HashSet<String>>);
+
+fn is_mtp(app: &AppHandle, serial: &str) -> bool {
+    app.state::<MtpPhones>().0.lock().unwrap().contains(serial)
+}
 
 /// Set while "Measure now" runs, so a copy and a measurement never overlap.
 #[derive(Default)]
@@ -96,9 +115,28 @@ fn open_adb_terms() -> Result<(), String> {
     Ok(())
 }
 
+/// Phones that adb reaches, then phones in MTP mode that adb does not reach. adb errors
+/// (no adb installed) leave the MTP phones.
 #[tauri::command]
 async fn list_devices(app: AppHandle) -> Result<Vec<Value>, String> {
-    blocking(move || query(&app, vec!["--devices".into()])).await?
+    let a = app.clone();
+    let adb: Vec<Value> = blocking(move || query(&a, vec!["--devices".into()])).await?.unwrap_or_default();
+    let ready: Vec<String> = adb
+        .iter()
+        .filter(|d| d["state"] == "device")
+        .filter_map(|d| d["serial"].as_str().map(String::from))
+        .collect();
+    let mtp = adbcp_mtp::devices(&ready).await;
+    let mtp_serials: HashSet<String> =
+        mtp.iter().filter_map(|d| d["serial"].as_str().map(String::from)).collect();
+    *app.state::<MtpPhones>().0.lock().unwrap() = mtp_serials.clone();
+    // A phone that adb lists but cannot use yet (unauthorized, offline) and that MTP can
+    // reach is listed once, as the MTP phone.
+    Ok(adb
+        .into_iter()
+        .filter(|d| !d["serial"].as_str().is_some_and(|s| mtp_serials.contains(s)))
+        .chain(mtp)
+        .collect())
 }
 
 /// Phones offering Wireless debugging on this network (adb's mDNS discovery).
@@ -139,18 +177,27 @@ fn qr_svg(text: String) -> Result<String, String> {
 
 #[tauri::command]
 async fn list_dir(app: AppHandle, serial: String, path: String) -> Result<Vec<Value>, String> {
+    if is_mtp(&app, &serial) {
+        return adbcp_mtp::ls(&serial, &path).await;
+    }
     blocking(move || query(&app, vec!["-s".into(), serial, "--ls".into(), path])).await?
 }
 
 /// Saved measurements for this phone and the kind of destination `dest` is.
 #[tauri::command]
 async fn show_profile(app: AppHandle, serial: String, dest: String) -> Result<Vec<Value>, String> {
+    if is_mtp(&app, &serial) {
+        return Ok(vec![serde_json::json!({ "event": "profile", "saved": false, "kind": "mtp" })]);
+    }
     blocking(move || query(&app, vec!["-s".into(), serial, "--show-profile".into(), dest])).await?
 }
 
 /// "Measure now": measures the phone at `dest` (about 10 seconds) and saves the results.
 #[tauri::command]
 async fn measure(app: AppHandle, serial: String, dest: String) -> Result<Vec<Value>, String> {
+    if is_mtp(&app, &serial) {
+        return Err("copies over MTP send one file at a time, so there is nothing to measure".into());
+    }
     {
         if app.state::<Running>().0.lock().unwrap().is_some() {
             return Err("a copy is running".into());
@@ -270,6 +317,14 @@ async fn local_trash(paths: Vec<String>) -> Result<(), String> {
 /// delete storage roots and standard folders).
 #[tauri::command]
 async fn phone_op(app: AppHandle, serial: String, op: String, paths: Vec<String>) -> Result<(), String> {
+    if is_mtp(&app, &serial) {
+        return match (op.as_str(), paths.as_slice()) {
+            ("mkdir", [p]) => adbcp_mtp::mkdir(&serial, p).await,
+            ("rename", [old, new]) => adbcp_mtp::rename(&serial, old, new).await,
+            ("delete", ps) if !ps.is_empty() => adbcp_mtp::delete(&serial, ps).await,
+            _ => Err(format!("unknown operation {op}")),
+        };
+    }
     let flag = match op.as_str() {
         "mkdir" => "--mkdir",
         "rename" => "--rename",
@@ -347,6 +402,31 @@ fn start_copy(app: AppHandle, running: State<Running>, req: CopyRequest) -> Resu
     if *app.state::<Measuring>().0.lock().unwrap() {
         return Err("wait for the measurement to finish".into());
     }
+    if is_mtp(&app, &req.serial) {
+        // MTP: one transfer at a time, so the speed options do not apply.
+        let stop = Arc::new(AtomicBool::new(false));
+        *slot = Some(Job::Mtp(Arc::clone(&stop)));
+        let a = app.clone();
+        let emit: adbcp_mtp::Emit = Arc::new(move |v| {
+            let _ = a.emit("engine-event", v);
+        });
+        let mreq = adbcp_mtp::CopyRequest {
+            serial: req.serial.clone(),
+            pull: req.pull,
+            sources: req.sources.clone(),
+            dest: req.dest.clone(),
+            verify: req.verify,
+            skip_existing: req.skip_existing,
+            fix_names: req.fix_names,
+        };
+        let a = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let code = adbcp_mtp::copy(mreq, emit, stop).await;
+            *a.state::<Running>().0.lock().unwrap() = None;
+            let _ = a.emit("engine-exit", code);
+        });
+        return Ok(());
+    }
     let mut cmd = engine(&app)?;
     cmd.args(["--json", "-s", &req.serial]);
     if req.pull {
@@ -396,7 +476,7 @@ fn start_copy(app: AppHandle, running: State<Running>, req: CopyRequest) -> Resu
         .process_group(0);
 
     let mut child = cmd.spawn().map_err(|e| format!("cannot start the copy engine: {e}"))?;
-    *slot = Some(child.id() as i32);
+    *slot = Some(Job::Engine(child.id() as i32));
 
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
@@ -432,9 +512,13 @@ fn start_copy(app: AppHandle, running: State<Running>, req: CopyRequest) -> Resu
 /// Asks the running copy to stop, like Ctrl-C in a terminal.
 #[tauri::command]
 fn cancel_copy(running: State<Running>) -> bool {
-    match *running.0.lock().unwrap() {
-        Some(pid) => {
-            unsafe { libc::kill(pid, libc::SIGINT) };
+    match &*running.0.lock().unwrap() {
+        Some(Job::Engine(pid)) => {
+            unsafe { libc::kill(*pid, libc::SIGINT) };
+            true
+        }
+        Some(Job::Mtp(stop)) => {
+            stop.store(true, Ordering::Relaxed);
             true
         }
         None => false,
@@ -453,6 +537,7 @@ fn autorun() -> Option<Value> {
 fn main() {
     let app = tauri::Builder::default()
         .manage(Running::default())
+        .manage(MtpPhones::default())
         .manage(Measuring::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::DragDrop(drag) = event {
@@ -503,8 +588,12 @@ fn main() {
     app.run(|app, event| {
         // Quitting while copying stops the whole copy, not just the engine script.
         if let tauri::RunEvent::Exit = event {
-            if let Some(pid) = *app.state::<Running>().0.lock().unwrap() {
-                unsafe { libc::kill(-pid, libc::SIGTERM) };
+            match &*app.state::<Running>().0.lock().unwrap() {
+                Some(Job::Engine(pid)) => unsafe {
+                    libc::kill(-*pid, libc::SIGTERM);
+                },
+                Some(Job::Mtp(stop)) => stop.store(true, Ordering::Relaxed),
+                None => {}
             }
         }
     });

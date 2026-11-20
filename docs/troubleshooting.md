@@ -18,6 +18,8 @@ In the app, open **Details** in the transfer bar to read all engine messages.
 | `offline` | Disconnect the cable and connect it again. If this does not help, run `adb kill-server`. |
 | "more than one device/emulator" | Select the phone with `-s SERIAL`. `./adbcp --devices` shows the serial numbers. |
 | "no devices/emulators found" | Check that USB debugging is on. See [Install](install.md#turn-on-usb-debugging). |
+| The app shows "· in use by another app" | macOS's photo service (`ptpcamerad`) or Android File Transfer holds the phone's File transfer mode. Quit Android File Transfer, or run `pkill -9 ptpcamerad`, then click **Refresh**. |
+| The app shows "· USB (no debugging)" and copies are slow | USB debugging is off, so the app uses MTP. Turn on USB debugging for copies 2 to 3 times faster. |
 
 ## Wi-Fi problems
 
