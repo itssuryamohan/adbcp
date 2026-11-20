@@ -72,6 +72,21 @@ adbcp starts a file again from the beginning in these cases:
 `--no-split` and `-j 1` send each file in one piece. Then a stopped file starts again
 from the beginning.
 
+`--no-resume` turns resuming off for one copy:
+
+- Compressible files of 4 GiB or more go whole, with compression.
+- adbcp records no parts.
+- A cancelled copy removes its partly copied files.
+
+Files that do not compress still go in parts, because parts are faster for them.
+
+Which is faster for compressible files of 4 GiB or more (S23 Ultra, USB 3):
+
+| Copy | Resume on (parts) | `--no-resume` (whole, zstd) |
+|---|---|---|
+| 1 file, 5.5 GB | 20 s | 29 s |
+| 3 files, 16.5 GB | 62 s | 53 s |
+
 To finish the other files too, add `--skip-existing`. It skips files that are already
 complete.
 
@@ -163,6 +178,7 @@ parallel streams. This made Wi-Fi copies about twice as fast in tests.
 | `--chunk SIZE` | Part size for split files. The default is `128M`. |
 | `--split-min SIZE` | Split files that do not compress, from this size. The default is `256M`. `0` splits all such files. |
 | `--no-split` | Never split files. This also turns off resuming inside files. |
+| `--no-resume` | Do not make large files resumable. Compressible files of 4 GiB or more go whole, with compression. |
 | `--recalibrate` | Measure this phone, cable, and destination again. |
 | `--no-calibrate` | Never measure before this copy. Use the saved measurement, or built-in values. |
 | `--burst` | Experimental. Restart adb in burst mode. It was slower on real copies in tests. |

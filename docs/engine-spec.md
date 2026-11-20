@@ -102,6 +102,7 @@ The engine uses these methods. Each one was measured on a real phone.
 3. **Large files in parts.** The engine splits large files into parts of 128 MiB. It sends the parts at the same time and writes them directly into place. It splits these files:
    - Files of 256 MiB or more that do not compress. The extension tells for video, photos, music, and archives. For other files, the engine compresses a 3 MiB sample (three slices of 1 MiB) with gzip. If the sample does not get at least 3% smaller, the file counts as incompressible. Encrypted game packages are an example.
    - Files of 4 GiB or more, also when they compress. Parts cannot use adb's compression, but they make the file resumable (see 6.3). On the test phone, compressible game files in parts took 32–34 s against 26 s with zstd. Thus smaller compressible files keep zstd.
+   - `--no-resume` turns off the 4 GiB rule. The engine then records no parts, and a cancel removes all partial files. Measured with 5.5 GB compressible game files (S23 Ultra, USB 3): one file took 20 s in parts and 29 s whole with zstd (one stream), but three files took 62 s in parts and 53 s whole (three streams with zstd).
 4. **Compression only where it helps.** Video, photos, music, and archives are already compressed. The engine sends them as they are. It compresses other data in transit when a quick test shows a gain.
 5. **Measured settings.** The engine measures the number of parallel transfers for each phone, cable, and destination (see section 5).
 6. **Fast bulk checks.** Resume and verify check all files in one pass. They do not send one request for each file.
@@ -136,6 +137,7 @@ The engine continues a stopped copy at two levels.
 
 The engine starts the file again in these cases:
 
+- `--no-resume` is set. The engine then ignores and removes old records.
 - The first line of the record does not match the source or the part size.
 - The part file is missing, or it is shorter than the end of the last recorded part.
 

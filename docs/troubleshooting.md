@@ -77,7 +77,8 @@ A stopped copy can leave `NAME.adbcp-part` files at the destination. These are t
 partly copied large files. If you do not want to continue the copy, delete them by hand.
 
 If "Resuming" does not show, adbcp starts the file again. This happens when the source
-file changed, or when the `.adbcp-part` file is missing. See
+file changed, when the `.adbcp-part` file is missing, or when **Resumable large files**
+is off (`--no-resume`). See
 [Continue a stopped copy](cli.md#continue-a-stopped-copy).
 
 ## The app does not open

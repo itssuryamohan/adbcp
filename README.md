@@ -100,7 +100,7 @@ These are not bugs, but they can surprise you:
 - **Shared storage (`/sdcard`) refuses some characters in names**: `" * : < > ? | \`. adbcp reports these files. `--fix-names` copies them with `_` instead.
 - **Measuring writes test files** into a hidden `.adbcp-probe…` folder in the destination. adbcp deletes them afterwards.
 - **`--burst` and `--libusb` restart the adb server.** This disconnects other adb tools, such as Android Studio, for a moment.
-- **A stopped copy keeps its partly copied large files.** Cancel, a cut cable, or a crash leaves `NAME.adbcp-part` files at the destination. Run the same copy again to finish them. If you do not want to continue, delete these files by hand.
+- **A stopped copy keeps its partly copied large files.** Cancel, a cut cable, or a crash leaves `NAME.adbcp-part` files at the destination. Run the same copy again to finish them. If you do not want to continue, delete these files by hand. To not keep them, turn off **Resumable large files** in the app, or use `--no-resume`.
 
 ## Documentation
 

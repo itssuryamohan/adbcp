@@ -103,6 +103,9 @@ options:
   --bench [DIR]     benchmark single push vs split -j 2/4/8 with a random file in DIR
                     (default /sdcard/Download); size via --bench-size (default 1G)
   --recalibrate     measure this phone, link and destination again (see "tuning")
+  --no-resume       do not make large files resumable: compressible files of 4 GiB or
+                    more go whole (with compression), no parts are recorded, and a
+                    cancelled copy removes its partly copied files
   --no-calibrate    never measure before this copy: use the saved measurement, or the
                     built-in settings if there is none
   --dry-run         print the transfer plan and exit
@@ -131,7 +134,9 @@ resume: large files go in parts when they do not compress (video, archives, and 
 files whose sample does not shrink) or are 4 GiB or more. If such a copy stops (Ctrl-C,
 cable, crash), the parts that landed stay in NAME.adbcp-part and are recorded in
 ~/Library/Caches/adbcp/parts. Running the same copy again sends only the missing parts.
-A changed source starts over. --no-split and -j 1 turn parts, and so resuming, off.
+A changed source starts over. --no-resume, --no-split and -j 1 turn resuming off.
+Parts are also faster for one big file (8 streams), but several big compressible files
+copy about 15% faster whole with zstd (--no-resume).
 
 adb lookup: \$ADB, then ./platform-tools/adb next to adbcp, adb in PATH, Homebrew
 (/opt/homebrew/bin, /usr/local/bin), Android Studio's SDK (\$ANDROID_HOME or
@@ -304,7 +309,10 @@ job() {
     *)     printf '%s 1 %s\n' "$bytes" "${kind#*/}" ;;
   esac >> "$ADBCP_TMP/done"
   case $kind in
-    chunk*) f=${kind#chunk}; printf '%s\n' "${f%/*}" >> "$(part_record "$([ -n "$ADBCP_PULL" ] && echo pull || echo push)" "$dst")" ;;
+    chunk*)
+      if [ -n "${ADBCP_RESUME:-}" ]; then
+        f=${kind#chunk}; printf '%s\n' "${f%/*}" >> "$(part_record "$([ -n "$ADBCP_PULL" ] && echo pull || echo push)" "$dst")"
+      fi ;;
   esac
   [ -z "$run" ] || rm -f "$run"
   if [ -n "$ADBCP_VERBOSE" ]; then
@@ -685,7 +693,7 @@ part_record() {
     "$(printf '%s|%s|%s\n' "$1" "${ANDROID_SERIAL:-}" "$2" | cksum | awk '{ print $1 "-" $2 }')"
 }
 part_header() { printf 'v1\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$CHUNK"; }   # SRC SIZE MTIME
-has_progress() { [ -f "$1" ] && [ "$(wc -l < "$1" | tr -d ' ')" -gt 1 ]; }
+has_progress() { [ "${NO_RESUME:-0}" = 0 ] && [ -f "$1" ] && [ "$(wc -l < "$1" | tr -d ' ')" -gt 1 ]; }
 
 is_google_signed() {
   local info
@@ -1050,7 +1058,7 @@ bench() {
 # -------------------------------------------------------------------- main ---
 main() {
   J=8 COMP=auto CHUNK=$((128 * BS)) SPLIT_MIN=$((256 * BS)) NO_SPLIT=0 VERIFY=0
-  WIFI_SCAN=0 WIFI_OP="" CHUNK_SET=0 NO_CAL=0
+  WIFI_SCAN=0 WIFI_OP="" CHUNK_SET=0 NO_CAL=0 NO_RESUME=0
   ADB_STATUS=0 GET_ADB=0 PULL=0 LIST_DEVICES=0 LS_PATH="" SHOW_PROFILE="" MEASURE="" FIX_NAMES=0 PHONE_OP="" J_SET=0 RECAL=0 SPLIT_SET=0 SKIP_EXISTING=0 DRY=0 FORCE=0 BURST=0 LIBUSB=0 BENCH=0 BENCH_SIZE=$((1024 * BS))
   local args=() a
   while [ $# -gt 0 ]; do
@@ -1071,6 +1079,7 @@ main() {
       --burst) BURST=1 ;;
       --recalibrate) RECAL=1 ;;
       --no-calibrate) NO_CAL=1 ;;
+      --no-resume) NO_RESUME=1 ;;
       --pull) PULL=1 ;;
       --devices) LIST_DEVICES=1 ;;
       --wifi-scan) WIFI_SCAN=1 ;;
@@ -1109,6 +1118,8 @@ main() {
   case $COMP in auto|none|any|lz4|zstd|brotli) ;; *) die "unknown compression: $COMP" ;; esac
   CHUNK=$(( (CHUNK + BS - 1) / BS * BS )); [ $CHUNK -gt 0 ] || CHUNK=$BS
   BENCH_SIZE=$(( (BENCH_SIZE + BS - 1) / BS * BS ))
+  # Without resume, compressible files are never split for resuming' sake (see PARTS_MIN).
+  if [ $NO_RESUME = 1 ]; then PARTS_MIN=$((1 << 62)); ADBCP_RESUME=""; else ADBCP_RESUME=1; fi
   [ $BENCH = 1 ] && { bench "$@"; exit; }
   [ $ADB_STATUS = 1 ] && { adb_status; exit 0; }
   [ $GET_ADB = 1 ] && { ADB=""; fetch_adb "$(cache_dir)"; adb_status; exit 0; }
@@ -1521,7 +1532,7 @@ main() {
 
   ADBCP_T0=$(now) ADBCP_TOTAL=$total NFILES=$((nfiles + NBADNAME)) ADBCP_VERBOSE=$VERBOSE ADBCP_CLR=$CLR
   ADBCP_PULL=$([ $PULL = 1 ] && echo 1)
-  export ADB ADBCP_TMP ADBCP_VERBOSE ADBCP_CLR ADBCP_PULL
+  export ADB ADBCP_TMP ADBCP_VERBOSE ADBCP_CLR ADBCP_PULL ADBCP_RESUME
   command -v caffeinate >/dev/null 2>&1 && { caffeinate -i -w $$ >/dev/null 2>&1 & }
   local monpid=""
   if [ $OUT_JSON = 1 ] || [ -z "$QUIET" ]; then monitor & monpid=$!; fi
@@ -1659,7 +1670,7 @@ resume_scan() {
   local dir size mtime src dst rec
   : > "$T/resume"; : > "$T/cand"
   find "$(cache_dir)/parts" -type f -mtime +30 -exec rm -f {} + 2>/dev/null   # forgotten records
-  [ -s "$T/split" ] || return 0
+  [ -s "$T/split" ] && [ $NO_RESUME = 0 ] || return 0
   dir=$([ $PULL = 1 ] && echo pull || echo push)
   while IFS=$'\t' read -r size mtime src dst; do
     rec=$(part_record $dir "$dst")
@@ -1692,6 +1703,7 @@ resume_scan() {
 is_resumed() { [ -s "$T/resume" ] && grep -Fxq -- "$1" "$T/resume.files"; }
 new_record() {   # push|pull SRC SIZE MTIME DEST
   local rec; rec=$(part_record "$1" "$5")
+  if [ $NO_RESUME = 1 ]; then rm -f "$rec"; return 0; fi
   mkdir -p "${rec%/*}" && { part_header "$2" "$3" "$4"; echo; } > "$rec" ||
     warn "cannot write $rec; this copy cannot resume"
 }

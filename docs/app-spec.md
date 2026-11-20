@@ -200,7 +200,7 @@ Example: "Copied 2 files, 1.2 GiB in 0:04 (301 MiB/s). Verified: all 2 files mat
 
 - **Retry failed files** runs the same copy again with "skip existing" on. This retry leaves out files with names that the phone does not allow, and reports them again.
 - **Copy with safe names** shows when some names are not allowed on the phone. It copies these files with `_` in place of each character that is not allowed. Example: `sound:effects.bnk` becomes `sound_effects.bnk`. Problems shows the new names first.
-- **Cancel** stops the copy in less than one second. Finished files stay. Large files sent in parts stay as `NAME.adbcp-part`. The next copy of the same items continues them. The engine removes the other partial files.
+- **Cancel** stops the copy in less than one second. Finished files stay. Large files sent in parts stay as `NAME.adbcp-part` when **Resumable large files** is on. The next copy of the same items continues them. The engine removes the other partial files.
 
 When the user quits the app during a copy, the app stops the copy in the same way.
 
@@ -211,6 +211,7 @@ The gear button opens the settings.
 | Setting | Default | Engine option |
 |---|---|---|
 | Verify after copying | On | `--verify` |
+| Resumable large files | On | `--no-resume` when off |
 | When names already exist | Ask | Replace: no option. Skip existing: `--skip-existing`. |
 | Show hidden files | Off | — |
 | Tuning: measurements and **Measure now** | — | `--show-profile`, `--measure` |

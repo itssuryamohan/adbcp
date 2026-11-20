@@ -13,7 +13,7 @@ const ui = {
   retry: $('retry'), safeNames: $('safe-names'), cancel: $('cancel'),
   problems: $('problems'), problemsTitle: $('problems-title'), problemList: $('problem-list'), log: $('log'),
   settings: $('settings'), closeSettings: $('close-settings'),
-  verify: $('verify'), conflicts: $('conflicts'), showHidden: $('show-hidden'),
+  verify: $('verify'), resumable: $('resumable'), conflicts: $('conflicts'), showHidden: $('show-hidden'),
   tuning: $('tuning'), measure: $('measure'), adbInfo: $('adb-info'),
   streams: $('streams'), compression: $('compression'), split: $('split'),
   partSize: $('part-size'), splitMin: $('split-min'), fixNames: $('fix-names'),
@@ -787,6 +787,7 @@ async function startNext() {
     sources: job.sources,
     dest: job.dest,
     verify: ui.verify.checked,
+    resumable: ui.resumable.checked,
     skipExisting: job.skipExisting,
     streams: ui.streams.value ? Number(ui.streams.value) : null,
     compression: ui.compression.value,
@@ -1034,7 +1035,7 @@ function collectSettings() {
   return {
     macPath: panes.mac.path, phonePath: panes.phone.path,
     macSort: panes.mac.sort, phoneSort: panes.phone.sort,
-    verify: ui.verify.checked, conflicts: ui.conflicts.value, showHidden: ui.showHidden.checked,
+    verify: ui.verify.checked, resumable: ui.resumable.checked, conflicts: ui.conflicts.value, showHidden: ui.showHidden.checked,
     streams: ui.streams.value, compression: ui.compression.value, split: ui.split.value,
     partSize: ui.partSize.value, splitMin: ui.splitMin.value,
     fixNames: ui.fixNames.checked, burst: ui.burst.checked, libusb: ui.libusb.checked,
@@ -1044,6 +1045,7 @@ function applySettings(s) {
   if (!s || typeof s !== 'object') return;
   const set = (select, v) => { if (v != null && [...select.options].some((o) => o.value === String(v))) select.value = String(v); };
   if (typeof s.verify === 'boolean') ui.verify.checked = s.verify;
+  if (typeof s.resumable === 'boolean') ui.resumable.checked = s.resumable;
   if (typeof s.showHidden === 'boolean') ui.showHidden.checked = s.showHidden;
   set(ui.conflicts, s.conflicts);
   set(ui.streams, s.streams); set(ui.compression, s.compression); set(ui.split, s.split);
@@ -1235,7 +1237,7 @@ ui.closeSettings.addEventListener('click', () => { ui.settings.hidden = true; })
 ui.settings.addEventListener('mousedown', (ev) => { if (ev.target === ui.settings) ui.settings.hidden = true; });
 ui.measure.addEventListener('click', measureNow);
 ui.showHidden.addEventListener('change', () => { renderPane(panes.mac); renderPane(panes.phone); });
-for (const c of [ui.verify, ui.conflicts, ui.showHidden, ui.streams, ui.compression, ui.split, ui.partSize, ui.splitMin, ui.fixNames, ui.burst, ui.libusb]) {
+for (const c of [ui.verify, ui.resumable, ui.conflicts, ui.showHidden, ui.streams, ui.compression, ui.split, ui.partSize, ui.splitMin, ui.fixNames, ui.burst, ui.libusb]) {
   c.addEventListener('change', () => {
     ui.partSize.disabled = ui.splitMin.disabled = ui.split.value !== '1';
     saveSettingsSoon();
@@ -1279,6 +1281,7 @@ listen('engine-exit', ({ payload }) => onExit(payload));
   await refreshTuning(true);
   if (job && Array.isArray(job.sources) && job.dest && currentDevice()) {
     if (job.verify !== undefined) ui.verify.checked = job.verify !== false;
+    if (job.resumable !== undefined) ui.resumable.checked = job.resumable !== false;
     if (job.pull) await loadPane(panes.mac, job.dest); else await loadPane(panes.phone, job.dest);
     enqueue({
       pull: !!job.pull, sources: job.sources, dest: withSlash(normalize(job.dest)), destSide: job.pull ? 'mac' : 'phone',

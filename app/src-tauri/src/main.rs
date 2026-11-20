@@ -389,6 +389,13 @@ struct CopyRequest {
     /// engine never measures by itself (--no-calibrate): the user chooses.
     #[serde(default)]
     calibrate: bool,
+    /// Make large files resumable (the default). Off: --no-resume.
+    #[serde(default = "yes")]
+    resumable: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Starts a copy. Options are built from typed fields, so the window cannot pass
@@ -469,6 +476,9 @@ fn start_copy(app: AppHandle, running: State<Running>, req: CopyRequest) -> Resu
         cmd.arg("--force");
     }
     cmd.arg(if req.calibrate && !req.pull { "--recalibrate" } else { "--no-calibrate" });
+    if !req.resumable {
+        cmd.arg("--no-resume");
+    }
     cmd.arg("--").args(&req.sources).arg(&req.dest);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())

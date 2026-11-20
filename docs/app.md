@@ -142,6 +142,7 @@ Click **⚙ Settings** to open the settings.
 | Setting | Default | What it does |
 |---|---|---|
 | Verify after copying | On | Compares each file on both sides after the copy. This adds 70 to 90% to the time. |
+| Resumable large files | On | A stopped copy continues where it stopped, and one very large file copies faster in parts. Off: several large files that compress well copy about 15% faster, and a cancel removes partly copied files. |
 | When names already exist | Ask | Ask, Replace, or Skip existing. |
 | Show hidden files | Off | Shows names that start with `.`. |
 | Tuning | — | Shows the saved measurement. **Measure now** measures the phone again (about 10 seconds). |
